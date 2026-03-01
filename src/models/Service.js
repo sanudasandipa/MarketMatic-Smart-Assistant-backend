@@ -57,10 +57,11 @@ const ServiceSchema = new mongoose.Schema(
 // Auto-generate tenantId before save if not set
 ServiceSchema.pre('save', function (next) {
   if (!this.tenantId) {
-    this.tenantId =
-      this.storeName.toLowerCase().replace(/\s+/g, '-') +
-      '-' +
-      Date.now().toString(36);
+    const base = (this.storeName || this.name || 'service')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+    this.tenantId = base + '-' + Date.now().toString(36);
   }
   next();
 });

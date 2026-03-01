@@ -15,7 +15,7 @@ const protect = async (req, res, next) => {
   }
 
   if (!token) {
-    return res.status(401).json({ detail: 'Not authorized – no token provided' });
+    return res.status(401).json({ message: 'Not authorized – no token provided' });
   }
 
   try {
@@ -24,16 +24,16 @@ const protect = async (req, res, next) => {
     req.user = await User.findById(decoded.id).select('-password');
 
     if (!req.user) {
-      return res.status(401).json({ detail: 'User belonging to this token no longer exists' });
+      return res.status(401).json({ message: 'User belonging to this token no longer exists' });
     }
 
     if (!req.user.is_active) {
-      return res.status(403).json({ detail: 'Account is deactivated' });
+      return res.status(403).json({ message: 'Account is deactivated' });
     }
 
     next();
   } catch (err) {
-    return res.status(401).json({ detail: 'Invalid or expired token' });
+    return res.status(401).json({ message: 'Invalid or expired token' });
   }
 };
 
@@ -45,7 +45,7 @@ const authorize = (...roles) => {
   return (req, res, next) => {
     if (!roles.includes(req.user.role)) {
       return res.status(403).json({
-        detail: `Role '${req.user.role}' is not authorized for this route`,
+        message: `Role '${req.user.role}' is not authorized for this route`,
       });
     }
     next();
