@@ -1,13 +1,14 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
 const User = require('../models/User');
+const Service = require('../models/Service');
 const { protect, authorize } = require('../middleware/auth');
 
 // All admin routes require authentication + admin or superadmin role
 router.use(protect);
 router.use(authorize('admin', 'superadmin'));
 
-// ─── GET /api/admin/dashboard ────────────────────────────────────────────────
+// â”€â”€â”€ GET /api/admin/dashboard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.get('/dashboard', async (req, res) => {
   try {
     // Admin sees stats scoped to their own store/service
@@ -24,7 +25,29 @@ router.get('/dashboard', async (req, res) => {
       },
     });
   } catch (err) {
-    return res.status(500).json({ detail: err.message });
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── GET /api/admin/service ──────────────────────────────────────────────────
+// Returns the admin's provisioned service record including the tenantId
+// (used as the RAG namespace / unique AI service token for this store)
+router.get('/service', async (req, res) => {
+  try {
+    if (!req.user.serviceId) {
+      return res.status(404).json({
+        message: 'No service provisioned for your account. Contact the Superadmin.',
+      });
+    }
+
+    const service = await Service.findById(req.user.serviceId);
+    if (!service) {
+      return res.status(404).json({ message: 'Service record not found' });
+    }
+
+    return res.json(service);
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
   }
 });
 
@@ -41,21 +64,21 @@ router.get('/users', async (req, res) => {
 
     return res.json(users.map((u) => u.toSafeObject()));
   } catch (err) {
-    return res.status(500).json({ detail: err.message });
+    return res.status(500).json({ message: err.message });
   }
 });
 
-// ─── PUT /api/admin/users/:id ─────────────────────────────────────────────────
+// â”€â”€â”€ PUT /api/admin/users/:id â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.put('/users/:id', async (req, res) => {
   try {
     const { full_name, username, is_active } = req.body;
     const user = await User.findById(req.params.id);
 
-    if (!user) return res.status(404).json({ detail: 'User not found' });
+    if (!user) return res.status(404).json({ message: 'User not found' });
 
     // Admin can only update regular users
     if (user.role !== 'user') {
-      return res.status(403).json({ detail: 'Cannot modify admin or superadmin accounts from here' });
+      return res.status(403).json({ message: 'Cannot modify admin or superadmin accounts from here' });
     }
 
     if (full_name !== undefined) user.full_name = full_name;
@@ -65,25 +88,26 @@ router.put('/users/:id', async (req, res) => {
     await user.save();
     return res.json(user.toSafeObject());
   } catch (err) {
-    return res.status(500).json({ detail: err.message });
+    return res.status(500).json({ message: err.message });
   }
 });
 
-// ─── DELETE /api/admin/users/:id ──────────────────────────────────────────────
+// â”€â”€â”€ DELETE /api/admin/users/:id â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.delete('/users/:id', async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
-    if (!user) return res.status(404).json({ detail: 'User not found' });
+    if (!user) return res.status(404).json({ message: 'User not found' });
 
     if (user.role !== 'user') {
-      return res.status(403).json({ detail: 'Cannot delete admin or superadmin accounts from here' });
+      return res.status(403).json({ message: 'Cannot delete admin or superadmin accounts from here' });
     }
 
     await user.deleteOne();
     return res.json({ message: 'User deleted successfully' });
   } catch (err) {
-    return res.status(500).json({ detail: err.message });
+    return res.status(500).json({ message: err.message });
   }
 });
 
 module.exports = router;
+
