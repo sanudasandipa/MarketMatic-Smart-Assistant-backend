@@ -35,17 +35,39 @@ router.get('/dashboard', async (req, res) => {
 });
 
 // ─── GET /api/superadmin/stats ────────────────────────────────────────────────
+// Returns a shape that matches the frontend SystemStats interface:
+// { total_users, active_users, superadmins, admins, regular_users, inactive_users }
 router.get('/stats', async (req, res) => {
   try {
-    const [admins, users, services] = await Promise.all([
-      User.find({ role: 'admin' }).select('-password').sort({ createdAt: -1 }),
+    const [
+      total_users,
+      active_users,
+      superadmins,
+      admins,
+      regular_users,
+      inactive_users,
+      allAdminDetails,
+      services,
+    ] = await Promise.all([
+      User.countDocuments(),
+      User.countDocuments({ is_active: true }),
+      User.countDocuments({ role: 'superadmin' }),
+      User.countDocuments({ role: 'admin' }),
       User.countDocuments({ role: 'user' }),
+      User.countDocuments({ is_active: false }),
+      User.find({ role: 'admin' }).select('-password').sort({ createdAt: -1 }),
       Service.find().sort({ createdAt: -1 }),
     ]);
 
     return res.json({
-      admins: admins.map((a) => a.toSafeObject()),
-      totalUsers: users,
+      total_users,
+      active_users,
+      superadmins,
+      admins,
+      regular_users,
+      inactive_users,
+      // Extended details (optional, used by future features)
+      adminDetails: allAdminDetails.map((a) => a.toSafeObject()),
       services,
     });
   } catch (err) {
