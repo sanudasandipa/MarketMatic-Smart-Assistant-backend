@@ -97,8 +97,8 @@ router.post('/users/:id/promote-to-admin', async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ detail: 'User not found' });
-    if (user.role === 'superadmin') {
-      return res.status(400).json({ detail: 'Cannot change superadmin role' });
+    if (user._id.toString() === req.user._id.toString()) {
+      return res.status(400).json({ detail: 'Cannot change your own role' });
     }
     user.role = 'admin';
     await user.save();
@@ -126,12 +126,28 @@ router.post('/users/:id/demote-to-user', async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
     if (!user) return res.status(404).json({ detail: 'User not found' });
-    if (user.role === 'superadmin') {
-      return res.status(400).json({ detail: 'Cannot demote a superadmin' });
+    if (user._id.toString() === req.user._id.toString()) {
+      return res.status(400).json({ detail: 'Cannot change your own role' });
     }
     user.role = 'user';
     await user.save();
     return res.json(user.toSafeObject());
+  } catch (err) {
+    return res.status(500).json({ detail: err.message });
+  }
+});
+
+// ─── DELETE /api/superadmin/users/:id ────────────────────────────────────────
+// Superadmin can delete any account (admin or other superadmin) except their own
+router.delete('/users/:id', async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ detail: 'User not found' });
+    if (user._id.toString() === req.user._id.toString()) {
+      return res.status(400).json({ detail: 'Cannot delete your own account' });
+    }
+    await user.deleteOne();
+    return res.json({ message: 'User deleted successfully' });
   } catch (err) {
     return res.status(500).json({ detail: err.message });
   }
