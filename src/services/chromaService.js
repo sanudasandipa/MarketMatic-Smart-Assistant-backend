@@ -12,6 +12,19 @@ const { ChromaClient } = require('chromadb');
 
 const CHROMA_URL = process.env.CHROMA_URL || 'http://localhost:8001';
 
+// Suppress the noisy ChromaDB warning about missing embedding function config.
+// We always supply embeddings explicitly (via Ollama), so this warning is safe to ignore.
+const _originalWarn = console.warn.bind(console);
+console.warn = (...args) => {
+  if (
+    typeof args[0] === 'string' &&
+    args[0].includes('No embedding function configuration found')
+  ) {
+    return; // swallow this specific chromadb client warning
+  }
+  _originalWarn(...args);
+};
+
 let _client = null;
 
 // chromadb v3 requires an embeddingFunction at collection creation time even
