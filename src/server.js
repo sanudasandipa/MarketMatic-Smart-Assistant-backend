@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const connectDB = require('./config/database');
+const { ensureChroma } = require('./utils/chromaManager');
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 const authRoutes        = require('./routes/auth');
@@ -55,4 +56,7 @@ const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
   console.log(`🚀  Smart Assistant Backend running on http://localhost:${PORT}`);
   console.log(`    ENV : ${process.env.NODE_ENV || 'development'}`);
+  // Auto-start ChromaDB if it is not already running
+  ensureChroma().catch((err) => console.error('ChromaDB auto-start error:', err.message));
 });
+

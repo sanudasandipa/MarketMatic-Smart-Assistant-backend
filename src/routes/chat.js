@@ -80,11 +80,12 @@ router.post('/admin/chat', protect, authorize('superadmin', 'admin', 'user'), as
     const result = await ragQuery({ question: message, context, tenantId, storeName });
 
     return res.json({
-      response:    result.answer,
-      model:       result.model,
-      usedFallback: result.usedFallback,
-      sources:     result.sources,
-      timestamp:   new Date(),
+      response:        result.answer,
+      model:           result.model,
+      usedFallback:    result.usedFallback,
+      knowledgeSource: result.knowledgeSource,          // 'store' | 'general'
+      sources:         result.sources,
+      timestamp:       new Date(),
     });
   } catch (err) {
     console.error('Admin chat error:', err.message);
@@ -118,11 +119,12 @@ router.post('/chat', async (req, res) => {
     const result = await ragQuery({ question: message, context, tenantId, storeName });
 
     return res.json({
-      response:    result.answer,
-      model:       result.model,
-      usedFallback: result.usedFallback,
-      sources:     result.sources,
-      timestamp:   new Date(),
+      response:        result.answer,
+      model:           result.model,
+      usedFallback:    result.usedFallback,
+      knowledgeSource: result.knowledgeSource,          // 'store' | 'general'
+      sources:         result.sources,
+      timestamp:       new Date(),
     });
   } catch (err) {
     console.error('Public chat error:', err.message);
