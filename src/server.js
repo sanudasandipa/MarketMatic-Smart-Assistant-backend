@@ -10,6 +10,7 @@ const adminRoutes       = require('./routes/admin');
 const superadminRoutes  = require('./routes/superadmin');
 const userRoutes        = require('./routes/user');
 const documentRoutes    = require('./routes/documents');
+const chatRoutes        = require('./routes/chat');
 // ── App ──────────────────────────────────────────────────────────────────────
 const app = express();
 
@@ -36,6 +37,7 @@ app.use('/api/admin',       adminRoutes);
 app.use('/api/admin/documents', documentRoutes);
 app.use('/api/superadmin',  superadminRoutes);
 app.use('/api/user',        userRoutes);
+app.use('/api',             chatRoutes);  // POST /api/admin/chat + POST /api/chat
 
 // ── 404 Handler ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => {
