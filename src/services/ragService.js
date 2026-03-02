@@ -6,7 +6,7 @@
  *  2. Query the tenant's ChromaDB vector collection for the top-k relevant chunks
  *  3. Build a context-aware prompt that includes retrieved knowledge
  *  4. Call local Ollama llama3 for the answer  (primary)
- *  5. Auto-failover to Grok API               (secondary, if Ollama fails)
+ *  5. Auto-failover to Groq API               (secondary, if Ollama fails)
  *  6. Return { answer, model, sources }
  *
  * Multi-tenant isolation: every query is strictly scoped to the store's
@@ -19,11 +19,8 @@ const { queryCollection }  = require('./chromaService');
 const OLLAMA_URL        = process.env.OLLAMA_URL        || 'http://localhost:11434';
 const OLLAMA_CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || 'llama3';
 const GROQ_API_KEY      = process.env.GROQ_API_KEY      || '';
-const GROQ_MODEL        = process.env.GROQ_MODEL        || 'llama3-8b-8192';
+const GROQ_MODEL        = process.env.GROQ_MODEL        || 'llama-3.1-8b-instant';
 const GROQ_API_URL      = 'https://api.groq.com/openai/v1/chat/completions';
-const GROK_API_KEY      = process.env.GROK_API_KEY      || '';
-const GROK_MODEL        = process.env.GROK_MODEL        || 'grok-3-mini';
-const GROK_API_URL      = 'https://api.x.ai/v1/chat/completions';
 
 // Timeout for local Ollama chat calls (ms) — fall back to cloud if exceeded
 const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '25000', 10);
@@ -140,37 +137,6 @@ async function callGroq(messages) {
   return data.choices?.[0]?.message?.content || '';
 }
 
-/**
- * Call xAI Grok API — secondary cloud fallback.
- */
-async function callGrok(messages) {
-  if (!GROK_API_KEY) {
-    throw new Error('GROK_API_KEY not configured');
-  }
-
-  const res = await fetch(GROK_API_URL, {
-    method:  'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${GROK_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model:       GROK_MODEL,
-      messages,
-      temperature: 0.7,
-      max_tokens:  512,
-    }),
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Grok API failed (${res.status}): ${body}`);
-  }
-
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || '';
-}
-
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -229,7 +195,7 @@ async function ragQuery({ question, context = [], tenantId, storeName }) {
     { role: 'user', content: question },
   ];
 
-  // ── Step 4 + 5: Call Ollama → Groq → Grok failover chain ────────────────────
+  // ── Step 4 + 5: Call Ollama → Groq failover chain ──────────────────────────
   let answer  = '';
   let model   = '';
   let usedFallback = false;
@@ -247,18 +213,10 @@ async function ragQuery({ question, context = [], tenantId, storeName }) {
       model  = `groq/${GROQ_MODEL}`;
       console.log(`✅  RAG answer via Groq fallback (${chromaChunks.length} chunks)`);
     } catch (groqErr) {
-      console.error(`❌  Groq failed: ${groqErr.message} — trying xAI Grok fallback`);
-
-      try {
-        answer = await callGrok(messages);
-        model  = `grok/${GROK_MODEL}`;
-        console.log(`✅  RAG answer via xAI Grok fallback (${chromaChunks.length} chunks)`);
-      } catch (grokErr) {
-        console.error('❌  All LLM backends failed:', grokErr.message);
-        throw new Error(
-          'Both the local AI and cloud fallbacks are currently unavailable. Please try again shortly.'
-        );
-      }
+      console.error('❌  All LLM backends failed:', groqErr.message);
+      throw new Error(
+        'The local AI and Groq cloud fallback are currently unavailable. Please try again shortly.'
+      );
     }
   }
 
