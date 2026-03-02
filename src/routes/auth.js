@@ -38,8 +38,9 @@ router.post('/register', async (req, res) => {
       role: 'admin',
       // Auto-verify if a service is pre-provisioned
       is_verified: !!service,
-      serviceId: service ? service._id : null,
-      storeName: service ? service.storeName : '',
+      serviceId:   service ? service._id    : null,
+      tenantId:    service ? service.tenantId : '',
+      storeName:   service ? service.storeName : '',
     });
 
     // Bind the service to this admin

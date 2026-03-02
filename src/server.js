@@ -9,7 +9,7 @@ const authRoutes        = require('./routes/auth');
 const adminRoutes       = require('./routes/admin');
 const superadminRoutes  = require('./routes/superadmin');
 const userRoutes        = require('./routes/user');
-
+const documentRoutes    = require('./routes/documents');
 // ── App ──────────────────────────────────────────────────────────────────────
 const app = express();
 
@@ -33,18 +33,19 @@ app.get('/health', (_req, res) => {
 // ── API Routes ────────────────────────────────────────────────────────────────
 app.use('/api/auth',        authRoutes);
 app.use('/api/admin',       adminRoutes);
+app.use('/api/admin/documents', documentRoutes);
 app.use('/api/superadmin',  superadminRoutes);
 app.use('/api/user',        userRoutes);
 
-// ── 404 Handler ───────────────────────────────────────────────────────────────
+// ── 404 Handler ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => {
-  res.status(404).json({ detail: 'Route not found' });
+  res.status(404).json({ message: 'Route not found' });
 });
 
-// ── Global Error Handler ──────────────────────────────────────────────────────
+// ── Global Error Handler ──────────────────────────────────────────────────────────
 app.use((err, _req, res, _next) => {
   console.error(err.stack);
-  res.status(err.status || 500).json({ detail: err.message || 'Internal Server Error' });
+  res.status(err.status || 500).json({ message: err.message || 'Internal Server Error' });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────

@@ -46,6 +46,12 @@ const UserSchema = new mongoose.Schema(
       ref: 'Service',
       default: null,
     },
+    // The unique RAG namespace for this admin's store (copy of Service.tenantId)
+    // Stored here so every request has it without an extra DB lookup
+    tenantId: {
+      type: String,
+      default: '',
+    },
     storeName: {
       type: String,
       default: '',
