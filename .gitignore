@@ -1,3 +1,7 @@
 node_modules/
 .env
 *.log
+
+chroma_data/
+chroma.log
+chroma.err

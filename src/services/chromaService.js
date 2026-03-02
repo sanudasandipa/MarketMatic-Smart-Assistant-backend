@@ -14,9 +14,26 @@ const CHROMA_URL = process.env.CHROMA_URL || 'http://localhost:8001';
 
 let _client = null;
 
+// chromadb v3 requires an embeddingFunction at collection creation time even
+// when embeddings are passed explicitly during upsert. We provide a no-op here
+// so the client doesn't try to instantiate DefaultEmbeddingFunction (which
+// requires the optional @chroma-core/default-embed package).
+const noopEmbeddingFunction = {
+  generate: async (_texts) => {
+    throw new Error(
+      'noopEmbeddingFunction.generate() called — you must supply embeddings explicitly when calling upsert()'
+    );
+  },
+};
+
 function getClient() {
   if (!_client) {
-    _client = new ChromaClient({ path: CHROMA_URL });
+    // ChromaDB v3+ deprecated the 'path' option in favour of host/port/ssl
+    const url  = new URL(CHROMA_URL);
+    const ssl  = url.protocol === 'https:';
+    const host = url.hostname;
+    const port = parseInt(url.port || (ssl ? '443' : '8000'), 10);
+    _client = new ChromaClient({ host, port, ssl });
   }
   return _client;
 }
@@ -30,6 +47,7 @@ async function getOrCreateCollection(tenantId) {
   return client.getOrCreateCollection({
     name: tenantId,
     metadata: { 'hnsw:space': 'cosine' },
+    embeddingFunction: noopEmbeddingFunction,
   });
 }
 

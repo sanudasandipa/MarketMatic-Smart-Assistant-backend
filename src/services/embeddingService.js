@@ -47,11 +47,12 @@ function chunkText(text) {
  */
 async function extractText(buffer, mimetype) {
   if (mimetype === 'application/pdf') {
-    const pdfParseModule = require('pdf-parse');
-    // pdf-parse may export via .default when resolved as an ESM-wrapped CJS module
-    const pdfParse = pdfParseModule.default || pdfParseModule;
-    const data = await pdfParse(buffer);
-    return data.text;
+    // pdf-parse v2 uses a class-based API: new PDFParse({ data: buffer }).getText()
+    const { PDFParse } = require('pdf-parse');
+    const parser = new PDFParse({ data: buffer });
+    const result = await parser.getText();
+    await parser.destroy();
+    return result.text;
   }
 
   if (
@@ -74,11 +75,22 @@ async function extractText(buffer, mimetype) {
  * @returns {Promise<number[]>}
  */
 async function getEmbedding(text) {
-  const res = await fetch(`${OLLAMA_URL}/api/embeddings`, {
+  // Try the modern /api/embed endpoint first (Ollama 0.1.26+)
+  // Falls back to the legacy /api/embeddings endpoint automatically.
+  let res = await fetch(`${OLLAMA_URL}/api/embed`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ model: OLLAMA_EMBED_MODEL, prompt: text }),
+    body:    JSON.stringify({ model: OLLAMA_EMBED_MODEL, input: text }),
   });
+
+  if (res.status === 404) {
+    // Older Ollama — fall back to legacy endpoint
+    res = await fetch(`${OLLAMA_URL}/api/embeddings`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ model: OLLAMA_EMBED_MODEL, prompt: text }),
+    });
+  }
 
   if (!res.ok) {
     const body = await res.text();
@@ -86,7 +98,8 @@ async function getEmbedding(text) {
   }
 
   const data = await res.json();
-  return data.embedding;
+  // /api/embed returns { embeddings: [[...]] }, legacy returns { embedding: [...] }
+  return data.embeddings ? data.embeddings[0] : data.embedding;
 }
 
 /**
