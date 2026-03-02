@@ -47,7 +47,9 @@ function chunkText(text) {
  */
 async function extractText(buffer, mimetype) {
   if (mimetype === 'application/pdf') {
-    const pdfParse = require('pdf-parse');
+    const pdfParseModule = require('pdf-parse');
+    // pdf-parse may export via .default when resolved as an ESM-wrapped CJS module
+    const pdfParse = pdfParseModule.default || pdfParseModule;
     const data = await pdfParse(buffer);
     return data.text;
   }

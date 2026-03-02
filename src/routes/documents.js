@@ -46,11 +46,33 @@ function getFileType(mimetype) {
   return 'txt';
 }
 
+// ─── Helper: resolve tenantId (backfill for pre-migration accounts) ──────────
+// Admins registered before the tenantId field was added to User may have an
+// empty tenantId. In that case, derive it from the linked Service and persist
+// it so subsequent requests are fast.
+async function resolveTenantId(user) {
+  if (user.tenantId) return user.tenantId;
+
+  if (!user.serviceId) return null;
+
+  const Service = require('../models/Service');
+  const svc = await Service.findById(user.serviceId);
+  if (!svc) return null;
+
+  const { tenantId } = svc;
+  await user.updateOne({ tenantId });
+  user.tenantId = tenantId; // mutate in-memory so current request has it too
+  return tenantId;
+}
+
 // ─── POST /api/admin/documents/upload ───────────────────────────────────────
 router.post('/upload', upload.single('file'), async (req, res) => {
   try {
-    // Admin must have a provisioned service (tenantId)
-    if (!req.user.tenantId) {
+    // Admin must have a provisioned service.
+    // tenantId may be empty for admins registered before this field was added.
+    const tenantId = await resolveTenantId(req.user);
+
+    if (!tenantId) {
       return res.status(403).json({
         message: 'No AI service provisioned. Ask the Superadmin to create a service for your email.',
       });
@@ -61,7 +83,6 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     }
 
     const { originalname, buffer, mimetype, size } = req.file;
-    const { tenantId } = req.user;
 
     // Create a MongoDB record immediately so we have an ID for Chroma chunk IDs
     const doc = await Document.create({
@@ -137,7 +158,10 @@ router.post('/upload', upload.single('file'), async (req, res) => {
 // ─── GET /api/admin/documents ────────────────────────────────────────────────
 router.get('/', async (req, res) => {
   try {
-    const docs = await Document.find({ tenantId: req.user.tenantId })
+    const tenantId = await resolveTenantId(req.user);
+    if (!tenantId) return res.json([]); // no service provisioned yet — return empty list
+
+    const docs = await Document.find({ tenantId })
       .sort({ createdAt: -1 })
       .select('-chromaIds'); // don't expose internal Chroma IDs to the frontend
 
@@ -150,9 +174,14 @@ router.get('/', async (req, res) => {
 // ─── DELETE /api/admin/documents/:id ────────────────────────────────────────
 router.delete('/:id', async (req, res) => {
   try {
+    const tenantId = await resolveTenantId(req.user);
+    if (!tenantId) {
+      return res.status(403).json({ message: 'No AI service provisioned for this account.' });
+    }
+
     const doc = await Document.findOne({
       _id:      req.params.id,
-      tenantId: req.user.tenantId, // scoped – admin can only delete own documents
+      tenantId, // scoped – admin can only delete own documents
     });
 
     if (!doc) {
