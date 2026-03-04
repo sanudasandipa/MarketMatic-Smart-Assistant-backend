@@ -14,10 +14,13 @@
 const express = require('express');
 const router  = express.Router();
 
-const { protect, authorize } = require('../middleware/auth');
-const { ragQuery }           = require('../services/ragService');
-const Service                = require('../models/Service');
-const User                   = require('../models/User');
+const { protect, authorize }  = require('../middleware/auth');
+const { ragQuery }            = require('../services/ragService');
+const { recordKnowledgeGap }  = require('../services/insightsService');
+const Service                 = require('../models/Service');
+const User                    = require('../models/User');
+const ChatSession              = require('../models/ChatSession');
+const UserMemory               = require('../models/UserMemory');
 
 // ─── Shared helper: resolve tenantId for pre-migration admin accounts ─────────
 async function resolveTenantId(user) {
@@ -65,26 +68,75 @@ function validateChatBody(req, res) {
 router.post('/admin/chat', protect, authorize('superadmin', 'admin', 'user'), async (req, res) => {
   if (!validateChatBody(req, res)) return;
 
-  const { message, context = [] } = req.body;
+  const { message, context = [], sessionId } = req.body;
 
   try {
     const tenantId = await resolveTenantId(req.user);
 
     if (!tenantId) {
-      // No service provisioned — still answer, but without RAG context
       console.warn(`⚠️  User ${req.user.email} has no tenantId — answering without RAG context`);
     }
 
     const storeName = tenantId ? await getStoreName(tenantId) : 'your business';
 
-    const result = await ragQuery({ question: message, context, tenantId, storeName });
+    // ── Load cross-session memory facts and prepend as system context ──────
+    let memoryContext = [];
+    if (tenantId) {
+      try {
+        const mem = await UserMemory.findOne({ userId: req.user._id });
+        if (mem && mem.facts.length > 0) {
+          // Sort by confidence, take top 10
+          const topFacts = [...mem.facts]
+            .sort((a, b) => b.confidence - a.confidence)
+            .slice(0, 10)
+            .map((f) => f.fact);
+
+          memoryContext = [{
+            role:    'system',
+            content: `[Business Memory from past sessions]\n${topFacts.join('\n')}`,
+          }];
+        }
+      } catch { /* memory is optional — never block chat */ }
+    }
+
+    // ── Save user message to session (if sessionId provided) ──────────────
+    let activeSession = null;
+    if (sessionId) {
+      activeSession = await ChatSession.findOne({ _id: sessionId, userId: req.user._id });
+      if (activeSession && !activeSession.isEnded) {
+        activeSession.messages.push({ role: 'user', content: message });
+        // Don't await save — non-blocking
+        activeSession.save().catch(() => {});
+      }
+    }
+
+    // Merge memory context at the start of the conversation context
+    const enrichedContext = [...memoryContext, ...context];
+
+    const result = await ragQuery({ question: message, context: enrichedContext, tenantId, storeName });
+
+    // ── Save assistant reply to session ────────────────────────────────────
+    if (activeSession && !activeSession.isEnded) {
+      activeSession.messages.push({
+        role:            'assistant',
+        content:         result.answer,
+        knowledgeSource: result.sources?.length > 0 ? 'store' : 'general',
+      });
+      activeSession.save().catch(() => {});
+    }
+
+    // ── Record knowledge gap if the answer had no store sources ────────────
+    if (tenantId && (!result.sources || result.sources.length === 0)) {
+      recordKnowledgeGap(message, tenantId, sessionId || null).catch(() => {});
+    }
 
     return res.json({
       response:        result.answer,
       model:           result.model,
       usedFallback:    result.usedFallback,
-      knowledgeSource: result.knowledgeSource,          // 'store' | 'general'
+      knowledgeSource: result.sources?.length > 0 ? 'store' : 'general',
       sources:         result.sources,
+      sessionId:       activeSession?._id || null,
       timestamp:       new Date(),
     });
   } catch (err) {
