@@ -57,13 +57,11 @@ router.post('/sessions', auth, async (req, res) => {
   try {
     const tenantId = await resolveTenantId(req.user);
 
-    if (!tenantId) {
-      return res.status(400).json({ message: 'No service provisioned — cannot create session' });
-    }
-
+    // Use 'general' as fallback so users without a provisioned service
+    // can still have sessions (chat will use general knowledge mode)
     const session = await ChatSession.create({
       userId:   req.user._id,
-      tenantId,
+      tenantId: tenantId || 'general',
     });
 
     res.status(201).json({ session });

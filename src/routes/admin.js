@@ -2,11 +2,23 @@
 const router = express.Router();
 const User = require('../models/User');
 const Service = require('../models/Service');
+const Document = require('../models/Document');
+const KnowledgeGap = require('../models/KnowledgeGap');
+const RagLog = require('../models/RagLog');
 const { protect, authorize } = require('../middleware/auth');
 
 // All admin routes require authentication + admin or superadmin role
 router.use(protect);
 router.use(authorize('admin', 'superadmin'));
+
+// ─── Shared: resolve tenantId for admin user ────────────────────────────────
+async function resolveTenantId(user) {
+  if (user.tenantId) return user.tenantId;
+  if (!user.serviceId) return null;
+  const svc = await Service.findById(user.serviceId);
+  if (!svc) return null;
+  return svc.tenantId;
+}
 
 // â”€â”€â”€ GET /api/admin/dashboard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 router.get('/dashboard', async (req, res) => {
@@ -104,6 +116,70 @@ router.delete('/users/:id', async (req, res) => {
 
     await user.deleteOne();
     return res.json({ message: 'User deleted successfully' });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── GET /api/admin/ai-metrics ───────────────────────────────────────────────
+router.get('/ai-metrics', async (req, res) => {
+  try {
+    const tenantId = await resolveTenantId(req.user);
+    if (!tenantId) return res.status(404).json({ message: 'No service provisioned' });
+
+    const [totalQueries, totalGaps, totalDocuments, allLogs] = await Promise.all([
+      RagLog.countDocuments({ tenantId }),
+      KnowledgeGap.countDocuments({ tenantId }),
+      Document.countDocuments({ tenantId }),
+      RagLog.find({ tenantId })
+        .select('modelUsed fallbackTriggered responseTimeMs knowledgeSource confidence')
+        .lean(),
+    ]);
+
+    const modelUsage = {};
+    let totalFallbacks   = 0;
+    let totalResponseMs  = 0;
+    let storeAnswers     = 0;
+
+    for (const log of allLogs) {
+      const key = log.modelUsed || 'unknown';
+      modelUsage[key] = (modelUsage[key] || 0) + 1;
+      if (log.fallbackTriggered) totalFallbacks++;
+      if (log.responseTimeMs)    totalResponseMs += log.responseTimeMs;
+      if (log.knowledgeSource === 'store') storeAnswers++;
+    }
+
+    return res.json({
+      totalQueries,
+      totalGaps,
+      totalDocuments,
+      modelUsage,
+      fallbackRate:        totalQueries > 0 ? parseFloat(((totalFallbacks / totalQueries) * 100).toFixed(1)) : 0,
+      avgResponseTimeMs:   totalQueries > 0 ? Math.round(totalResponseMs / totalQueries) : 0,
+      storeKnowledgeRate:  totalQueries > 0 ? parseFloat(((storeAnswers  / totalQueries) * 100).toFixed(1)) : 0,
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── GET /api/admin/gaps/analytics ─────────────────────────────────────────
+router.get('/gaps/analytics', async (req, res) => {
+  try {
+    const tenantId = await resolveTenantId(req.user);
+    if (!tenantId) return res.status(404).json({ message: 'No service provisioned' });
+
+    const [topGaps, totalGaps, unresolvedGaps] = await Promise.all([
+      KnowledgeGap.find({ tenantId })
+        .sort({ frequency: -1 })
+        .limit(10)
+        .select('question frequency lastAsked resolved')
+        .lean(),
+      KnowledgeGap.countDocuments({ tenantId }),
+      KnowledgeGap.countDocuments({ tenantId, resolved: false }),
+    ]);
+
+    return res.json({ topGaps, totalGaps, unresolvedGaps });
   } catch (err) {
     return res.status(500).json({ message: err.message });
   }

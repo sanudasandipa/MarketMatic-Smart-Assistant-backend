@@ -17,6 +17,7 @@ const router  = express.Router();
 const { protect, authorize }  = require('../middleware/auth');
 const { ragQuery }            = require('../services/ragService');
 const { recordKnowledgeGap }  = require('../services/insightsService');
+const RagLog                  = require('../models/RagLog');
 const Service                 = require('../models/Service');
 const User                    = require('../models/User');
 const ChatSession              = require('../models/ChatSession');
@@ -99,44 +100,73 @@ router.post('/admin/chat', protect, authorize('superadmin', 'admin', 'user'), as
       } catch { /* memory is optional — never block chat */ }
     }
 
-    // ── Save user message to session (if sessionId provided) ──────────────
+    // ── Resolve or auto-create a session ──────────────────────────────────
     let activeSession = null;
     if (sessionId) {
-      activeSession = await ChatSession.findOne({ _id: sessionId, userId: req.user._id });
-      if (activeSession && !activeSession.isEnded) {
-        activeSession.messages.push({ role: 'user', content: message });
-        // Don't await save — non-blocking
-        activeSession.save().catch(() => {});
+      // Find the existing session — only if it hasn't been ended
+      const found = await ChatSession.findOne({ _id: sessionId, userId: req.user._id });
+      if (found && !found.isEnded) activeSession = found;
+    }
+
+    // Auto-create when no valid session exists but the user has a tenant
+    if (!activeSession && tenantId) {
+      try {
+        activeSession = await ChatSession.create({ userId: req.user._id, tenantId });
+      } catch (autoErr) {
+        console.warn('⚠️  Auto-session create failed:', autoErr.message);
       }
+    }
+
+    // Save user message atomically — no race condition, avoids stale-doc overwrites
+    if (activeSession) {
+      await ChatSession.updateOne(
+        { _id: activeSession._id },
+        { $push: { messages: { role: 'user', content: message } } }
+      ).catch((err) => console.warn('⚠️  User message save failed:', err.message));
     }
 
     // Merge memory context at the start of the conversation context
     const enrichedContext = [...memoryContext, ...context];
 
+    const startTime = Date.now();
     const result = await ragQuery({ question: message, context: enrichedContext, tenantId, storeName });
+    const responseTimeMs = Date.now() - startTime;
 
-    // ── Save assistant reply to session ────────────────────────────────────
-    if (activeSession && !activeSession.isEnded) {
-      activeSession.messages.push({
-        role:            'assistant',
-        content:         result.answer,
-        knowledgeSource: result.sources?.length > 0 ? 'store' : 'general',
-      });
-      activeSession.save().catch(() => {});
+    // ── Non-blocking: write RAG performance log (research metrics) ───────────────
+    if (tenantId) {
+      RagLog.create({
+        tenantId,
+        query:             message,
+        chunksRetrieved:   result.sources?.length || 0,
+        knowledgeSource:   result.knowledgeSource,
+        modelUsed:         result.model,
+        responseTimeMs,
+        fallbackTriggered: result.usedFallback || false,
+        confidence:        result.confidence,
+      }).catch(() => {});
+    }
+
+    // ── Save assistant reply atomically ───────────────────────────────────────
+    if (activeSession) {
+      await ChatSession.updateOne(
+        { _id: activeSession._id },
+        { $push: { messages: { role: 'assistant', content: result.answer, knowledgeSource: result.knowledgeSource } } }
+      ).catch((err) => console.warn('⚠️  Assistant message save failed:', err.message));
     }
 
     // ── Record knowledge gap if the answer had no store sources ────────────
     if (tenantId && (!result.sources || result.sources.length === 0)) {
-      recordKnowledgeGap(message, tenantId, sessionId || null).catch(() => {});
+      recordKnowledgeGap(message, tenantId, activeSession?._id || null).catch(() => {});
     }
 
     return res.json({
       response:        result.answer,
       model:           result.model,
       usedFallback:    result.usedFallback,
-      knowledgeSource: result.sources?.length > 0 ? 'store' : 'general',
+      knowledgeSource: result.knowledgeSource,
+      confidence:      result.confidence,
       sources:         result.sources,
-      sessionId:       activeSession?._id || null,
+      sessionId:       activeSession?._id?.toString() || null,
       timestamp:       new Date(),
     });
   } catch (err) {
@@ -168,13 +198,28 @@ router.post('/chat', async (req, res) => {
 
     const storeName = svc.storeName || svc.name || 'this store';
 
+    const startTime = Date.now();
     const result = await ragQuery({ question: message, context, tenantId, storeName });
+    const responseTimeMs = Date.now() - startTime;
+
+    // ── Non-blocking: write RAG performance log ──────────────────────────────
+    RagLog.create({
+      tenantId,
+      query:             message,
+      chunksRetrieved:   result.sources?.length || 0,
+      knowledgeSource:   result.knowledgeSource,
+      modelUsed:         result.model,
+      responseTimeMs,
+      fallbackTriggered: result.usedFallback || false,
+      confidence:        result.confidence,
+    }).catch(() => {});
 
     return res.json({
       response:        result.answer,
       model:           result.model,
       usedFallback:    result.usedFallback,
-      knowledgeSource: result.knowledgeSource,          // 'store' | 'general'
+      knowledgeSource: result.knowledgeSource,
+      confidence:      result.confidence,
       sources:         result.sources,
       timestamp:       new Date(),
     });

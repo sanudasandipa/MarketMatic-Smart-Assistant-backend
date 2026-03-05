@@ -22,7 +22,8 @@ const messageSchema = new mongoose.Schema(
 const chatSessionSchema = new mongoose.Schema(
   {
     userId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-    tenantId: { type: String, required: true, index: true },
+    // 'general' is the fallback for users without a provisioned service
+    tenantId: { type: String, required: true, index: true, default: 'general' },
 
     // AI-generated metadata (filled when the session is ended / has enough messages)
     title:    { type: String, default: null },  // e.g. "Return policy & shipping costs"

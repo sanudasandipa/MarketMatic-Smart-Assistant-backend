@@ -5,9 +5,10 @@
  *  1. Embed the user's question via local Ollama nomic-embed-text
  *  2. Query the tenant's ChromaDB vector collection for the top-k relevant chunks
  *  3. Build a context-aware prompt that includes retrieved knowledge
- *  4. Call local Ollama llama3 for the answer  (primary)
- *  5. Auto-failover to Groq API               (secondary, if Ollama fails)
- *  6. Return { answer, model, sources }
+ *  4. Call local Ollama llama3 for the answer  (primary — offline, zero cost)
+ *  5. Auto-failover to Modal GPU              (secondary, if Ollama fails)
+ *  6. Auto-failover to Groq API               (tertiary, if Modal fails)
+ *  7. Return { answer, model, sources, confidence }
  *
  * Multi-tenant isolation: every query is strictly scoped to the store's
  * ChromaDB collection — no cross-tenant data leakage is possible.
@@ -16,14 +17,18 @@
 const { getEmbedding }     = require('./embeddingService');
 const { queryCollection }  = require('./chromaService');
 
+// Local Ollama (primary) — runs entirely offline, zero cost
 const OLLAMA_URL        = process.env.OLLAMA_URL        || 'http://localhost:11434';
 const OLLAMA_CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || 'llama3';
-const GROQ_API_KEY      = process.env.GROQ_API_KEY      || '';
-const GROQ_MODEL        = process.env.GROQ_MODEL        || 'llama-3.1-8b-instant';
-const GROQ_API_URL      = 'https://api.groq.com/openai/v1/chat/completions';
 
-// Timeout for local Ollama chat calls (ms) — fall back to cloud if exceeded
-const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '25000', 10);
+// Remote Modal GPU (secondary) — OpenAI-compatible endpoint, auth via ?api_key=
+const MODAL_CHAT_URL = process.env.MODAL_CHAT_URL || '';
+const MODAL_API_KEY  = process.env.MODAL_API_KEY  || '';
+const MODAL_MODEL    = 'llama-3.1-8b';
+
+const GROQ_API_KEY   = process.env.GROQ_API_KEY   || '';
+const GROQ_MODEL     = process.env.GROQ_MODEL     || 'llama-3.1-8b-instant';
+const GROQ_API_URL   = 'https://api.groq.com/openai/v1/chat/completions';
 
 // Cosine distance threshold: chunks with distance > this are considered irrelevant.
 // Cosine distance is in [0, 2]; practically relevant matches are usually < 0.45.
@@ -84,38 +89,65 @@ function buildSystemPrompt(chunks, storeName = 'this store', knowledgeSource = '
 // ─── LLM Callers ─────────────────────────────────────────────────────────────
 
 /**
- * Call local Ollama llama3 with a timeout.
+ * Call local Ollama chat API — primary LLM (offline, zero cost).
+ * Ollama must be running: ollama serve
+ * Model must be pulled:   ollama pull llama3
  *
  * @param {Array<{role:string, content:string}>} messages
  * @returns {Promise<string>} response text
  */
 async function callOllama(messages) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+  const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({
+      model:  OLLAMA_CHAT_MODEL,
+      messages,
+      stream: false,
+    }),
+  });
 
-  try {
-    const res = await fetch(`${OLLAMA_URL}/api/chat`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({
-        model:   OLLAMA_CHAT_MODEL,
-        messages,
-        stream:  false,
-        options: { temperature: 0.7, num_predict: 512 },
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`Ollama chat failed (${res.status}): ${body}`);
-    }
-
-    const data = await res.json();
-    return data.message?.content || data.response || '';
-  } finally {
-    clearTimeout(timer);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Ollama chat failed (${res.status}): ${body}`);
   }
+
+  const data    = await res.json();
+  const content = data.message?.content;
+  if (!content) throw new Error('Ollama returned empty response');
+  return content;
+}
+
+/**
+ * Call the remote Modal GPU (Llama 3.1-8B-Instruct) — OpenAI-compatible API.
+ * Auth is passed as a query parameter: ?api_key=<key>
+ *
+ * @param {Array<{role:string, content:string}>} messages
+ * @returns {Promise<string>} response text
+ */
+async function callModal(messages) {
+  if (!MODAL_CHAT_URL || !MODAL_API_KEY) {
+    throw new Error('MODAL_CHAT_URL or MODAL_API_KEY not configured');
+  }
+
+  const url = `${MODAL_CHAT_URL}?api_key=${MODAL_API_KEY}`;
+
+  const res = await fetch(url, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({
+      model:    MODAL_MODEL,
+      messages,
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Modal API failed (${res.status}): ${body}`);
+  }
+
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content || '';
 }
 
 /**
@@ -226,9 +258,9 @@ async function ragQuery({ question, context = [], tenantId, storeName }) {
     { role: 'user', content: question },
   ];
 
-  // ── Step 4 + 5: Call Ollama → Groq failover chain ──────────────────────────
-  let answer  = '';
-  let model   = '';
+  // ── Step 4 + 5: Ollama (local) → Modal (GPU) → Groq failover chain ──────────
+  let answer       = '';
+  let model        = '';
   let usedFallback = false;
 
   try {
@@ -236,30 +268,44 @@ async function ragQuery({ question, context = [], tenantId, storeName }) {
     model  = `ollama/${OLLAMA_CHAT_MODEL}`;
     console.log(`✅  RAG answer via ${model} [${knowledgeSource}] (${chromaChunks.length} chunks)`);
   } catch (ollamaErr) {
-    console.error(`❌  Ollama failed: ${ollamaErr.message} — trying Groq fallback`);
+    console.warn(`⚠️  Ollama unavailable: ${ollamaErr.message} — trying Modal GPU`);
     usedFallback = true;
 
     try {
-      answer = await callGroq(messages);
-      model  = `groq/${GROQ_MODEL}`;
-      console.log(`✅  RAG answer via Groq fallback [${knowledgeSource}] (${chromaChunks.length} chunks)`);
-    } catch (groqErr) {
-      console.error('❌  All LLM backends failed:', groqErr.message);
-      throw new Error(
-        'The local AI and Groq cloud fallback are currently unavailable. Please try again shortly.'
-      );
+      answer = await callModal(messages);
+      model  = `modal/${MODAL_MODEL}`;
+      console.log(`✅  RAG answer via Modal fallback [${knowledgeSource}] (${chromaChunks.length} chunks)`);
+    } catch (modalErr) {
+      console.warn(`⚠️  Modal GPU unavailable: ${modalErr.message} — trying Groq`);
+
+      try {
+        answer = await callGroq(messages);
+        model  = `groq/${GROQ_MODEL}`;
+        console.log(`✅  RAG answer via Groq fallback [${knowledgeSource}] (${chromaChunks.length} chunks)`);
+      } catch (groqErr) {
+        console.error('❌  All LLM backends failed:', groqErr.message);
+        throw new Error(
+          'All AI backends are currently unavailable (Ollama, Modal, Groq). Please try again shortly.'
+        );
+      }
     }
   }
+
+  // Confidence = highest relevance score across retrieved chunks (null when general-knowledge mode)
+  const confidence = chromaChunks.length > 0
+    ? parseFloat(Math.max(...chromaChunks.map((c) => 1 - (c.distance ?? 1))).toFixed(3))
+    : null;
 
   return {
     answer,
     model,
     usedFallback,
     knowledgeSource,   // 'store' | 'general'
+    confidence,        // null when no store chunks used
     sources: chromaChunks.map((c) => ({
       filename:   c.metadata?.filename,
       chunkIndex: c.metadata?.chunkIndex,
-      relevance:  c.distance != null ? (1 - c.distance).toFixed(3) : null,
+      relevance:  c.distance != null ? parseFloat((1 - c.distance).toFixed(3)) : null,
     })),
   };
 }
