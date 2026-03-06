@@ -6,6 +6,7 @@ const Document = require('../models/Document');
 const KnowledgeGap = require('../models/KnowledgeGap');
 const RagLog = require('../models/RagLog');
 const { protect, authorize } = require('../middleware/auth');
+const { getToolRegistry } = require('../services/toolService');
 
 // All admin routes require authentication + admin or superadmin role
 router.use(protect);
@@ -64,12 +65,22 @@ router.get('/service', async (req, res) => {
 });
 
 // ─── GET /api/admin/users ─────────────────────────────────────────────────────
+// Returns only customers (role:'user') who registered under this admin's store.
 router.get('/users', async (req, res) => {
   try {
-    const skip = parseInt(req.query.skip) || 0;
+    const skip  = parseInt(req.query.skip)  || 0;
     const limit = parseInt(req.query.limit) || 100;
 
-    const users = await User.find({ role: 'user' })
+    const tenantId = await resolveTenantId(req.user);
+
+    // Build filter: if admin has a tenantId, scope to their store's customers.
+    // Superadmin (no tenantId) sees all users for oversight.
+    const filter = { role: 'user' };
+    if (tenantId && req.user.role !== 'superadmin') {
+      filter.customerTenantId = tenantId;
+    }
+
+    const users = await User.find(filter)
       .skip(skip)
       .limit(limit)
       .sort({ createdAt: -1 });
@@ -180,6 +191,71 @@ router.get('/gaps/analytics', async (req, res) => {
     ]);
 
     return res.json({ topGaps, totalGaps, unresolvedGaps });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── GET /api/admin/tools ─────────────────────────────────────────────────────
+// Returns the full tool registry (all available tools) and which ones are enabled.
+router.get('/tools', async (req, res) => {
+  try {
+    const registry = getToolRegistry();
+    if (!req.user.serviceId) {
+      return res.json({ tools: registry, enabledTools: [], assistantTone: 'professional', assistantLanguage: 'en' });
+    }
+    const service = await Service.findById(req.user.serviceId);
+    return res.json({
+      tools:             registry,
+      enabledTools:      service?.enabledTools      || [],
+      assistantTone:     service?.assistantTone     || 'professional',
+      assistantLanguage: service?.assistantLanguage || 'en',
+    });
+  } catch (err) {
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── PUT /api/admin/service/settings ─────────────────────────────────────────
+// Admin updates AI assistant configuration: enabled tools, tone, language.
+router.put('/service/settings', async (req, res) => {
+  try {
+    if (!req.user.serviceId) {
+      return res.status(404).json({ message: 'No service provisioned for your account.' });
+    }
+
+    const { enabledTools, assistantTone, assistantLanguage } = req.body;
+
+    const VALID_TONES = ['professional', 'friendly', 'concise'];
+    const allowedToolIds = getToolRegistry().map((t) => t.id);
+
+    const update = {};
+
+    if (Array.isArray(enabledTools)) {
+      // Whitelist: only accept known tool IDs
+      update.enabledTools = enabledTools.filter((id) => allowedToolIds.includes(id));
+    }
+    if (assistantTone && VALID_TONES.includes(assistantTone)) {
+      update.assistantTone = assistantTone;
+    }
+    if (assistantLanguage && typeof assistantLanguage === 'string' && assistantLanguage.length <= 10) {
+      update.assistantLanguage = assistantLanguage;
+    }
+
+    const service = await Service.findByIdAndUpdate(
+      req.user.serviceId,
+      { $set: update },
+      { new: true }
+    );
+
+    if (!service) return res.status(404).json({ message: 'Service not found' });
+
+    return res.json({
+      message:           'Assistant settings updated',
+      enabledTools:      service.enabledTools,
+      assistantTone:     service.assistantTone,
+      assistantLanguage: service.assistantLanguage,
+    });
   } catch (err) {
     return res.status(500).json({ message: err.message });
   }

@@ -1,0 +1,100 @@
+version: "3.9"
+
+services:
+  # ── MongoDB ────────────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    container_name: smart_assistant_mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASS:-changeme}
+      MONGO_INITDB_DATABASE: smart_assistant
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - app_net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ── ChromaDB ───────────────────────────────────────────────────────────────
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: smart_assistant_chroma
+    restart: unless-stopped
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /data
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - chroma_data:/data
+    ports:
+      - "8001:8000"   # chroma listens on 8000 internally; exposed as 8001 on host
+    networks:
+      - app_net
+
+  # ── Ollama (embedding model server) ───────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: smart_assistant_ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - app_net
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── Node.js Backend ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: smart_assistant_backend:latest
+    container_name: smart_assistant_backend
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 8000
+      # Override URLs to use Docker service names instead of localhost
+      MONGO_URI: ${MONGO_URI}
+      CHROMA_URL: http://chroma:8000
+      OLLAMA_URL: http://ollama:11434
+    ports:
+      - "8000:8000"
+    networks:
+      - app_net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# ── Volumes ────────────────────────────────────────────────────────────────────
+volumes:
+  mongo_data:
+  chroma_data:
+  ollama_data:
+
+# ── Network ────────────────────────────────────────────────────────────────────
+networks:
+  app_net:
+    driver: bridge

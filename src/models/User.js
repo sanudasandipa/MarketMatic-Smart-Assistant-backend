@@ -56,6 +56,14 @@ const UserSchema = new mongoose.Schema(
       type: String,
       default: '',
     },
+    // For role:'user' (customer) accounts — links them to the store they belong to.
+    // Populated during customer self-registration via POST /api/auth/register/customer.
+    // Left empty for admin / superadmin accounts (they use tenantId from their Service).
+    customerTenantId: {
+      type: String,
+      default: '',
+      index: true,
+    },
   },
   { timestamps: true }
 );
@@ -83,7 +91,9 @@ UserSchema.methods.toSafeObject = function () {
     is_active: this.is_active,
     is_verified: this.is_verified,
     serviceId: this.serviceId,
+    tenantId: this.tenantId,
     storeName: this.storeName,
+    customerTenantId: this.customerTenantId,
     created_at: this.createdAt,
   };
 };

@@ -16,6 +16,7 @@ const router  = express.Router();
 
 const { protect, authorize }  = require('../middleware/auth');
 const { ragQuery }            = require('../services/ragService');
+const { runEnabledTools }     = require('../services/toolService');
 const { recordKnowledgeGap }  = require('../services/insightsService');
 const RagLog                  = require('../models/RagLog');
 const Service                 = require('../models/Service');
@@ -36,13 +37,20 @@ async function resolveTenantId(user) {
   return svc.tenantId;
 }
 
-// ─── Shared helper: get store display name from a tenantId ────────────────────
-async function getStoreName(tenantId) {
+// ─── Shared helper: load all store config fields needed by ragQuery ────────────
+async function getStoreConfig(tenantId) {
   try {
     const svc = await Service.findOne({ tenantId });
-    return svc?.storeName || svc?.name || 'this store';
+    if (!svc) return { storeName: 'this store', storeCategory: '', assistantTone: 'professional', assistantLanguage: 'en', enabledTools: [] };
+    return {
+      storeName:         svc.storeName || svc.name || 'this store',
+      storeCategory:     svc.storeCategory || '',
+      assistantTone:     svc.assistantTone     || 'professional',
+      assistantLanguage: svc.assistantLanguage || 'en',
+      enabledTools:      svc.enabledTools      || [],
+    };
   } catch {
-    return 'this store';
+    return { storeName: 'this store', storeCategory: '', assistantTone: 'professional', assistantLanguage: 'en', enabledTools: [] };
   }
 }
 
@@ -78,7 +86,8 @@ router.post('/admin/chat', protect, authorize('superadmin', 'admin', 'user'), as
       console.warn(`⚠️  User ${req.user.email} has no tenantId — answering without RAG context`);
     }
 
-    const storeName = tenantId ? await getStoreName(tenantId) : 'your business';
+    const storeConfig = tenantId ? await getStoreConfig(tenantId) : { storeName: 'your business', storeCategory: '', assistantTone: 'professional', assistantLanguage: 'en', enabledTools: [] };
+    const { storeName, storeCategory, assistantTone, assistantLanguage } = storeConfig;
 
     // ── Load cross-session memory facts and prepend as system context ──────
     let memoryContext = [];
@@ -128,8 +137,14 @@ router.post('/admin/chat', protect, authorize('superadmin', 'admin', 'user'), as
     // Merge memory context at the start of the conversation context
     const enrichedContext = [...memoryContext, ...context];
 
+    // ── Agentic tool layer: run enabled tools if intent matches ──────────────────
+    const toolContext = await runEnabledTools(message, tenantId, storeConfig.enabledTools).catch(() => '');
+    if (toolContext) {
+      enrichedContext.push({ role: 'system', content: toolContext });
+    }
+
     const startTime = Date.now();
-    const result = await ragQuery({ question: message, context: enrichedContext, tenantId, storeName });
+    const result = await ragQuery({ question: message, context: enrichedContext, tenantId, storeName, storeCategory, assistantTone, assistantLanguage });
     const responseTimeMs = Date.now() - startTime;
 
     // ── Non-blocking: write RAG performance log (research metrics) ───────────────
@@ -196,10 +211,20 @@ router.post('/chat', async (req, res) => {
       return res.status(404).json({ message: 'Store not found' });
     }
 
-    const storeName = svc.storeName || svc.name || 'this store';
+    const storeName         = svc.storeName         || svc.name || 'this store';
+    const storeCategory     = svc.storeCategory     || '';
+    const assistantTone     = svc.assistantTone     || 'professional';
+    const assistantLanguage = svc.assistantLanguage || 'en';
+    const enabledTools      = svc.enabledTools      || [];
+
+    // ── Agentic tool layer (public endpoint) ──────────────────────────────
+    const toolContext = await runEnabledTools(message, tenantId, enabledTools).catch(() => '');
+    const enrichedPublicContext = toolContext
+      ? [...context, { role: 'system', content: toolContext }]
+      : context;
 
     const startTime = Date.now();
-    const result = await ragQuery({ question: message, context, tenantId, storeName });
+    const result = await ragQuery({ question: message, context: enrichedPublicContext, tenantId, storeName, storeCategory, assistantTone, assistantLanguage });
     const responseTimeMs = Date.now() - startTime;
 
     // ── Non-blocking: write RAG performance log ──────────────────────────────

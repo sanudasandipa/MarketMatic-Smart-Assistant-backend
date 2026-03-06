@@ -90,6 +90,46 @@ router.get('/me', protect, (req, res) => {
   return res.json(req.user.toSafeObject());
 });
 
+// ─── POST /api/auth/register/customer ─────────────────────────────────────────
+// Customer self-registration tied to a specific store via tenantId.
+// Used by the customer-facing chat widget or embedded portal.
+router.post('/register/customer', async (req, res) => {
+  try {
+    const { email, username, password, full_name, tenantId } = req.body;
+
+    if (!email || !username || !password || !tenantId) {
+      return res.status(400).json({ message: 'email, username, password and tenantId are required' });
+    }
+
+    const service = await Service.findOne({ tenantId, status: 'active' });
+    if (!service) {
+      return res.status(404).json({ message: 'Store not found or not active' });
+    }
+
+    const existing = await User.findOne({ $or: [{ email }, { username }] });
+    if (existing) {
+      const field = existing.email === email.toLowerCase() ? 'email' : 'username';
+      return res.status(400).json({ message: `${field} is already in use` });
+    }
+
+    const user = await User.create({
+      email,
+      username,
+      password,
+      full_name:        full_name || '',
+      role:             'user',
+      is_verified:      true,
+      customerTenantId: tenantId,
+      storeName:        service.storeName || service.name || '',
+    });
+
+    return res.status(201).json(user.toSafeObject());
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: err.message });
+  }
+});
+
 // â”€â”€â”€ POST /api/auth/logout â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // JWT is stateless â€“ logout is handled client-side by discarding the token.
 // This endpoint exists for API symmetry and optional server-side logging.

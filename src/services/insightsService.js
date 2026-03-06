@@ -23,7 +23,11 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL   = process.env.GROQ_MODEL   || 'llama-3.1-8b-instant';
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
-// ─── Groq helper ─────────────────────────────────────────────────────────────
+const OLLAMA_URL        = process.env.OLLAMA_URL        || 'http://localhost:11434';
+const OLLAMA_CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || 'llama3';
+const OLLAMA_TIMEOUT_MS = parseInt(process.env.OLLAMA_TIMEOUT_MS || '25000', 10);
+
+// ─── LLM helpers (Groq primary → Ollama offline fallback) ────────────────────
 async function callGroq(systemPrompt, userPrompt, maxTokens = 256) {
   if (!GROQ_API_KEY) throw new Error('GROQ_API_KEY not set');
 
@@ -51,6 +55,50 @@ async function callGroq(systemPrompt, userPrompt, maxTokens = 256) {
 
   const data = await res.json();
   return data.choices?.[0]?.message?.content || '';
+}
+
+/**
+ * Ollama fallback for offline environments — uses same chat model as ragService.
+ */
+async function callOllama(systemPrompt, userPrompt) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal:  controller.signal,
+      body: JSON.stringify({
+        model:   OLLAMA_CHAT_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user',   content: userPrompt },
+        ],
+        stream: false,
+      }),
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error('Ollama timed out');
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!res.ok) throw new Error(`Ollama chat failed (${res.status})`);
+  const data = await res.json();
+  return data.message?.content || '';
+}
+
+/**
+ * Try Groq first; fall back to Ollama when offline.
+ */
+async function callLLM(systemPrompt, userPrompt, maxTokens = 256) {
+  try {
+    return await callGroq(systemPrompt, userPrompt, maxTokens);
+  } catch (groqErr) {
+    console.warn(`⚠️  Insights: Groq unavailable (${groqErr.message}) — falling back to Ollama`);
+    return await callOllama(systemPrompt, userPrompt);
+  }
 }
 
 // ─── Conversation transcript helper ──────────────────────────────────────────
@@ -84,7 +132,7 @@ extract structured metadata. Always respond ONLY with valid JSON — no markdown
 Conversation:
 ${transcript}`;
 
-  const raw = await callGroq(systemPrompt, userPrompt, 200);
+  const raw = await callLLM(systemPrompt, userPrompt, 200);
 
   try {
     // Strip any accidental markdown code fences
@@ -134,7 +182,7 @@ Each fact object:
 Conversation:
 ${transcript}`;
 
-  const raw  = await callGroq(systemPrompt, userPrompt, 400);
+  const raw  = await callLLM(systemPrompt, userPrompt, 400);
 
   let facts = [];
   try {

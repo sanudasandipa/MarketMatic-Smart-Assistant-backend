@@ -18,8 +18,10 @@ const { getEmbedding }     = require('./embeddingService');
 const { queryCollection }  = require('./chromaService');
 
 // Local Ollama (primary) — runs entirely offline, zero cost
-const OLLAMA_URL        = process.env.OLLAMA_URL        || 'http://localhost:11434';
-const OLLAMA_CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || 'llama3';
+const OLLAMA_URL         = process.env.OLLAMA_URL         || 'http://localhost:11434';
+const OLLAMA_CHAT_MODEL  = process.env.OLLAMA_CHAT_MODEL  || 'llama3';
+// Max ms to wait for Ollama before falling through to cloud fallback (default 25 s)
+const OLLAMA_TIMEOUT_MS  = parseInt(process.env.OLLAMA_TIMEOUT_MS || '25000', 10);
 
 // Remote Modal GPU (secondary) — OpenAI-compatible endpoint, auth via ?api_key=
 const MODAL_CHAT_URL = process.env.MODAL_CHAT_URL || '';
@@ -36,6 +38,19 @@ const RELEVANCE_THRESHOLD = parseFloat(process.env.RAG_RELEVANCE_THRESHOLD || '0
 
 // ─── System prompt builder ───────────────────────────────────────────────────
 
+// ─── Domain-to-persona mapping ────────────────────────────────────────────────
+// Maps storeCategory values to domain-specific assistant behaviour instructions.
+const DOMAIN_GUIDANCE = {
+  pharmacy:    'You assist customers with medicine availability, dosage info (non-prescription), health products, and pharmacy services. Always recommend consulting a licensed pharmacist or doctor for medical decisions.',
+  electronics: 'You assist customers with product specs, compatibility, warranty, troubleshooting, and tech purchases. Be precise with technical details.',
+  clothing:    'You help customers with sizing, style recommendations, fabric care, return policies, and stock availability. Keep a friendly, fashion-forward tone.',
+  restaurant:  'You assist with menu items, allergens, opening hours, reservations, and delivery options. Be warm and appetising in descriptions.',
+  grocery:     'You help customers with product availability, prices, promotions, and store locations. Be clear and direct.',
+  real_estate: 'You assist clients with property listings, rental/sale inquiries, viewing bookings, and neighbourhood information. Be professional and informative.',
+  automotive:  'You assist with vehicle specs, service bookings, spare parts, and pricing. Be technical yet accessible.',
+  education:   'You assist students and parents with course information, enrolment, schedules, and fees. Be encouraging and clear.',
+};
+
 /**
  * Build the system prompt.
  *
@@ -44,13 +59,44 @@ const RELEVANCE_THRESHOLD = parseFloat(process.env.RAG_RELEVANCE_THRESHOLD || '0
  *                                       transparent with the user about it.
  *
  * @param {Array<{document:string, metadata:object}>} chunks  - filtered relevant chunks
- * @param {string}  storeName   - human-readable store name
+ * @param {string}  storeName      - human-readable store name
  * @param {'store'|'general'} knowledgeSource - resolved by the caller
+ * @param {string}  [storeCategory] - business domain (e.g. 'pharmacy', 'electronics')
+ * @param {string}  [assistantTone] - 'professional' | 'friendly' | 'concise'
+ * @param {string}  [assistantLanguage] - BCP-47 language code, e.g. 'en', 'ar'
  */
-function buildSystemPrompt(chunks, storeName = 'this store', knowledgeSource = 'store') {
+function buildSystemPrompt(
+  chunks,
+  storeName         = 'this store',
+  knowledgeSource   = 'store',
+  storeCategory     = '',
+  assistantTone     = 'professional',
+  assistantLanguage = 'en'
+) {
+  // ── Tone instruction ────────────────────────────────────────────────────────
+  const toneMap = {
+    professional: 'Maintain a professional, courteous tone at all times.',
+    friendly:     'Use a warm, friendly and conversational tone.',
+    concise:      'Be extremely concise — give short, direct answers without filler.',
+  };
+  const toneInstruction = toneMap[assistantTone] || toneMap.professional;
+
+  // ── Language instruction ────────────────────────────────────────────────────
+  const langInstruction = assistantLanguage && assistantLanguage !== 'en'
+    ? `Always respond in the language with BCP-47 code "${assistantLanguage}". If the user writes in a different language, still reply in "${assistantLanguage}" unless the store policy differs.`
+    : '';
+
+  // ── Domain-specific guidance ────────────────────────────────────────────────
+  const domainGuidance = storeCategory && DOMAIN_GUIDANCE[storeCategory.toLowerCase()]
+    ? `DOMAIN (${storeCategory}): ${DOMAIN_GUIDANCE[storeCategory.toLowerCase()]}`
+    : '';
+
   const basePersona =
     `You are a professional AI assistant for ${storeName}. ` +
-    `You respond in a clear, concise, and helpful manner appropriate for both customers and staff.`;
+    `You respond in a clear, concise, and helpful manner appropriate for both customers and staff. ` +
+    toneInstruction +
+    (langInstruction  ? `\n${langInstruction}` : '') +
+    (domainGuidance   ? `\n${domainGuidance}`  : '');
 
   // ── General-knowledge mode ─────────────────────────────────────────────────
   if (knowledgeSource === 'general') {
@@ -97,15 +143,29 @@ function buildSystemPrompt(chunks, storeName = 'this store', knowledgeSource = '
  * @returns {Promise<string>} response text
  */
 async function callOllama(messages) {
-  const res = await fetch(`${OLLAMA_URL}/api/chat`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({
-      model:  OLLAMA_CHAT_MODEL,
-      messages,
-      stream: false,
-    }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
+
+  let res;
+  try {
+    res = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal:  controller.signal,
+      body:    JSON.stringify({
+        model:  OLLAMA_CHAT_MODEL,
+        messages,
+        stream: false,
+      }),
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(`Ollama timed out after ${OLLAMA_TIMEOUT_MS / 1000}s (model cold-loading or overloaded)`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!res.ok) {
     const body = await res.text();
@@ -188,14 +248,17 @@ async function callGroq(messages) {
  * Full RAG query pipeline.
  *
  * @param {object} params
- * @param {string}   params.question    - The user's current message
- * @param {Array}    params.context     - Previous conversation [ {role, content}, ... ]
- * @param {string}   params.tenantId    - Store namespace used to scope ChromaDB query
- * @param {string}   [params.storeName] - Human-readable store name for the system prompt
+ * @param {string}   params.question          - The user's current message
+ * @param {Array}    params.context           - Previous conversation [ {role, content}, ... ]
+ * @param {string}   params.tenantId          - Store namespace used to scope ChromaDB query
+ * @param {string}   [params.storeName]       - Human-readable store name for the system prompt
+ * @param {string}   [params.storeCategory]   - Business domain (e.g. 'pharmacy', 'electronics')
+ * @param {string}   [params.assistantTone]   - 'professional' | 'friendly' | 'concise'
+ * @param {string}   [params.assistantLanguage] - BCP-47 language code
  *
  * @returns {Promise<{answer:string, model:string, sources:Array}>}
  */
-async function ragQuery({ question, context = [], tenantId, storeName }) {
+async function ragQuery({ question, context = [], tenantId, storeName, storeCategory = '', assistantTone = 'professional', assistantLanguage = 'en' }) {
   // ── Step 1: Embed the question ──────────────────────────────────────────────
   let questionEmbedding = null;
   let chromaChunks = [];
@@ -246,7 +309,7 @@ async function ragQuery({ question, context = [], tenantId, storeName }) {
 
   // ── Step 3: Determine knowledge source & build the full message array ────────
   const knowledgeSource = chromaChunks.length > 0 ? 'store' : 'general';
-  const systemPrompt    = buildSystemPrompt(chromaChunks, storeName, knowledgeSource);
+  const systemPrompt    = buildSystemPrompt(chromaChunks, storeName, knowledgeSource, storeCategory, assistantTone, assistantLanguage);
 
   // Trim conversation history to last N exchanges to stay within context window
   const MAX_HISTORY = 10;

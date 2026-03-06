@@ -39,6 +39,25 @@ const ServiceSchema = new mongoose.Schema(
       type: String,
       default: '',
     },
+    // ── Agentic assistant configuration ──────────────────────────────────────
+    // List of tool identifiers the admin has activated for their store.
+    // Available tools: 'inventory_check', 'business_hours', 'contact_info',
+    //                  'promotions', 'order_status'
+    enabledTools: {
+      type: [String],
+      default: [],
+    },
+    // Response tone: 'professional' | 'friendly' | 'concise'
+    assistantTone: {
+      type: String,
+      enum: ['professional', 'friendly', 'concise'],
+      default: 'professional',
+    },
+    // BCP-47 language code for default response language (e.g. 'en', 'ar', 'fr')
+    assistantLanguage: {
+      type: String,
+      default: 'en',
+    },
     // Unique slug used as the tenant namespace in RAG
     tenantId: {
       type: String,

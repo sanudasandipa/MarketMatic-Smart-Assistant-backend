@@ -11,6 +11,13 @@
 const OLLAMA_URL        = process.env.OLLAMA_URL        || 'http://localhost:11434';
 const OLLAMA_EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || 'nomic-embed-text';
 
+// Remote embedding fallback — any OpenAI-compatible /v1/embeddings endpoint.
+// E.g. a second Ollama on a VPS, or a self-hosted FastEmbed server.
+// Set REMOTE_EMBED_URL and REMOTE_EMBED_MODEL in .env to enable.
+const REMOTE_EMBED_URL   = process.env.REMOTE_EMBED_URL   || '';
+const REMOTE_EMBED_MODEL = process.env.REMOTE_EMBED_MODEL || 'nomic-embed-text';
+const REMOTE_EMBED_KEY   = process.env.REMOTE_EMBED_KEY   || '';
+
 // ─── Chunking config ──────────────────────────────────────────────────────────
 const CHUNK_SIZE    = 500;  // characters per chunk
 const CHUNK_OVERLAP = 100;  // overlap between consecutive chunks
@@ -70,11 +77,28 @@ async function extractText(buffer, mimetype) {
 
 /**
  * Generate a single embedding vector using the local Ollama model.
+ * Falls back to a configured remote embedding endpoint if Ollama is unavailable.
  *
  * @param {string} text
  * @returns {Promise<number[]>}
  */
 async function getEmbedding(text) {
+  // ── Primary: local Ollama ─────────────────────────────────────────────────
+  try {
+    return await _ollamaEmbed(text);
+  } catch (ollamaErr) {
+    if (REMOTE_EMBED_URL) {
+      console.warn(`⚠️  Ollama embedding failed (${ollamaErr.message}) — trying remote fallback`);
+      return await _remoteEmbed(text);
+    }
+    throw ollamaErr;  // re-throw; caller handles gracefully
+  }
+}
+
+/**
+ * Ollama embedding (primary — offline, zero cost).
+ */
+async function _ollamaEmbed(text) {
   // Try the modern /api/embed endpoint first (Ollama 0.1.26+)
   // Falls back to the legacy /api/embeddings endpoint automatically.
   let res = await fetch(`${OLLAMA_URL}/api/embed`, {
@@ -100,6 +124,32 @@ async function getEmbedding(text) {
   const data = await res.json();
   // /api/embed returns { embeddings: [[...]] }, legacy returns { embedding: [...] }
   return data.embeddings ? data.embeddings[0] : data.embedding;
+}
+
+/**
+ * Remote OpenAI-compatible embedding fallback.
+ * Activated when REMOTE_EMBED_URL is set and Ollama is unreachable.
+ */
+async function _remoteEmbed(text) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (REMOTE_EMBED_KEY) headers['Authorization'] = `Bearer ${REMOTE_EMBED_KEY}`;
+
+  const res = await fetch(`${REMOTE_EMBED_URL}/v1/embeddings`, {
+    method:  'POST',
+    headers,
+    body:    JSON.stringify({ model: REMOTE_EMBED_MODEL, input: text }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Remote embedding fallback failed (${res.status}): ${body}`);
+  }
+
+  const data = await res.json();
+  const vector = data.data?.[0]?.embedding;
+  if (!vector) throw new Error('Remote embedding returned no vector');
+  console.log(`✅  Embedding via remote fallback (${REMOTE_EMBED_URL})`);
+  return vector;
 }
 
 /**

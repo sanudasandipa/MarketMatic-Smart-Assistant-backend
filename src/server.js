@@ -55,10 +55,53 @@ app.use((err, _req, res, _next) => {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🚀  Smart Assistant Backend running on http://localhost:${PORT}`);
   console.log(`    ENV : ${process.env.NODE_ENV || 'development'}`);
   // Auto-start ChromaDB if it is not already running
   ensureChroma().catch((err) => console.error('ChromaDB auto-start error:', err.message));
+  // Pre-warm the Ollama chat model so the first real request isn't blocked by
+  // cold-load time (phi3 is 2.2 GB and takes 30-60 s on CPU from cold).
+  warmUpOllama();
 });
+
+/**
+ * Send a minimal prompt to Ollama so the model is loaded into RAM before
+ * the first user request arrives.  Runs silently in the background.
+ */
+async function warmUpOllama() {
+  const OLLAMA_URL   = process.env.OLLAMA_URL        || 'http://localhost:11434';
+  const OLLAMA_MODEL = process.env.OLLAMA_CHAT_MODEL || 'phi3';
+  const TIMEOUT_MS   = parseInt(process.env.OLLAMA_TIMEOUT_MS || '90000', 10);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    console.log(`⏳  Warming up Ollama model '${OLLAMA_MODEL}' in background…`);
+    const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal:  controller.signal,
+      body: JSON.stringify({
+        model:    OLLAMA_MODEL,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream:   false,
+      }),
+    });
+    if (res.ok) {
+      console.log(`✅  Ollama '${OLLAMA_MODEL}' is warm and ready.`);
+    } else {
+      console.warn(`⚠️  Ollama warmup responded with status ${res.status} — model may not be pulled.`);
+    }
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      console.warn(`⚠️  Ollama warmup timed out after ${TIMEOUT_MS / 1000}s — Groq will be used as fallback.`);
+    } else {
+      console.warn(`⚠️  Ollama warmup failed: ${err.message} — is Ollama running? (run: ollama serve)`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
