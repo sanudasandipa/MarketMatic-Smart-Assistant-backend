@@ -256,4 +256,20 @@ router.post('/chat', async (req, res) => {
   }
 });
 
+// ─── GET /api/chat/store/:tenantId — lightweight store validation (no LLM) ────
+// Used by the public chat widget on page load to verify the store exists.
+router.get('/chat/store/:tenantId', async (req, res) => {
+  try {
+    const svc = await Service.findOne({ tenantId: req.params.tenantId });
+    if (!svc) return res.status(404).json({ error: 'Store not found' });
+    res.json({
+      storeName:  svc.storeName || svc.name || 'Assistant',
+      tenantId:   svc.tenantId,
+      active:     svc.active !== false,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 module.exports = router;

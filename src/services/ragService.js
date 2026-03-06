@@ -6,9 +6,8 @@
  *  2. Query the tenant's ChromaDB vector collection for the top-k relevant chunks
  *  3. Build a context-aware prompt that includes retrieved knowledge
  *  4. Call local Ollama llama3 for the answer  (primary — offline, zero cost)
- *  5. Auto-failover to Modal GPU              (secondary, if Ollama fails)
- *  6. Auto-failover to Groq API               (tertiary, if Modal fails)
- *  7. Return { answer, model, sources, confidence }
+ *  5. Auto-failover to Groq API               (cloud fallback, if Ollama fails)
+ *  6. Return { answer, model, sources, confidence }
  *
  * Multi-tenant isolation: every query is strictly scoped to the store's
  * ChromaDB collection — no cross-tenant data leakage is possible.
@@ -22,11 +21,6 @@ const OLLAMA_URL         = process.env.OLLAMA_URL         || 'http://localhost:1
 const OLLAMA_CHAT_MODEL  = process.env.OLLAMA_CHAT_MODEL  || 'llama3';
 // Max ms to wait for Ollama before falling through to cloud fallback (default 25 s)
 const OLLAMA_TIMEOUT_MS  = parseInt(process.env.OLLAMA_TIMEOUT_MS || '25000', 10);
-
-// Remote Modal GPU (secondary) — OpenAI-compatible endpoint, auth via ?api_key=
-const MODAL_CHAT_URL = process.env.MODAL_CHAT_URL || '';
-const MODAL_API_KEY  = process.env.MODAL_API_KEY  || '';
-const MODAL_MODEL    = 'llama-3.1-8b';
 
 const GROQ_API_KEY   = process.env.GROQ_API_KEY   || '';
 const GROQ_MODEL     = process.env.GROQ_MODEL     || 'llama-3.1-8b-instant';
@@ -179,38 +173,6 @@ async function callOllama(messages) {
 }
 
 /**
- * Call the remote Modal GPU (Llama 3.1-8B-Instruct) — OpenAI-compatible API.
- * Auth is passed as a query parameter: ?api_key=<key>
- *
- * @param {Array<{role:string, content:string}>} messages
- * @returns {Promise<string>} response text
- */
-async function callModal(messages) {
-  if (!MODAL_CHAT_URL || !MODAL_API_KEY) {
-    throw new Error('MODAL_CHAT_URL or MODAL_API_KEY not configured');
-  }
-
-  const url = `${MODAL_CHAT_URL}?api_key=${MODAL_API_KEY}`;
-
-  const res = await fetch(url, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({
-      model:    MODAL_MODEL,
-      messages,
-    }),
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Modal API failed (${res.status}): ${body}`);
-  }
-
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || '';
-}
-
-/**
  * Call Groq API — OpenAI-compatible, extremely fast llama3 inference.
  * Primary cloud fallback when Ollama is unavailable.
  */
@@ -321,7 +283,7 @@ async function ragQuery({ question, context = [], tenantId, storeName, storeCate
     { role: 'user', content: question },
   ];
 
-  // ── Step 4 + 5: Ollama (local) → Modal (GPU) → Groq failover chain ──────────
+  // ── Step 4: Ollama (local) → Groq (cloud) failover chain ─────────────────────
   let answer       = '';
   let model        = '';
   let usedFallback = false;
@@ -331,26 +293,18 @@ async function ragQuery({ question, context = [], tenantId, storeName, storeCate
     model  = `ollama/${OLLAMA_CHAT_MODEL}`;
     console.log(`✅  RAG answer via ${model} [${knowledgeSource}] (${chromaChunks.length} chunks)`);
   } catch (ollamaErr) {
-    console.warn(`⚠️  Ollama unavailable: ${ollamaErr.message} — trying Modal GPU`);
+    console.warn(`⚠️  Ollama unavailable: ${ollamaErr.message} — trying Groq`);
     usedFallback = true;
 
     try {
-      answer = await callModal(messages);
-      model  = `modal/${MODAL_MODEL}`;
-      console.log(`✅  RAG answer via Modal fallback [${knowledgeSource}] (${chromaChunks.length} chunks)`);
-    } catch (modalErr) {
-      console.warn(`⚠️  Modal GPU unavailable: ${modalErr.message} — trying Groq`);
-
-      try {
-        answer = await callGroq(messages);
-        model  = `groq/${GROQ_MODEL}`;
-        console.log(`✅  RAG answer via Groq fallback [${knowledgeSource}] (${chromaChunks.length} chunks)`);
-      } catch (groqErr) {
-        console.error('❌  All LLM backends failed:', groqErr.message);
-        throw new Error(
-          'All AI backends are currently unavailable (Ollama, Modal, Groq). Please try again shortly.'
-        );
-      }
+      answer = await callGroq(messages);
+      model  = `groq/${GROQ_MODEL}`;
+      console.log(`✅  RAG answer via Groq fallback [${knowledgeSource}] (${chromaChunks.length} chunks)`);
+    } catch (groqErr) {
+      console.error('❌  All LLM backends failed:', groqErr.message);
+      throw new Error(
+        'All AI backends are currently unavailable (Ollama, Groq). Please try again shortly.'
+      );
     }
   }
 
