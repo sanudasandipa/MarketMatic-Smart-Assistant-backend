@@ -103,7 +103,7 @@ router.post('/admin/chat', protect, authorize('superadmin', 'admin', 'user'), as
 
           memoryContext = [{
             role:    'system',
-            content: `[Business Memory from past sessions]\n${topFacts.join('\n')}`,
+            content: `Relevant context from this customer's previous conversations with ${storeName}: ${topFacts.join(' ')}`,
           }];
         }
       } catch { /* memory is optional — never block chat */ }

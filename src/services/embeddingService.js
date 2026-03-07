@@ -99,21 +99,43 @@ async function getEmbedding(text) {
  * Ollama embedding (primary — offline, zero cost).
  */
 async function _ollamaEmbed(text) {
+  const EMBED_TIMEOUT_MS = 35000; // 35s — enough for warm response, aborts on cold start
   // Try the modern /api/embed endpoint first (Ollama 0.1.26+)
   // Falls back to the legacy /api/embeddings endpoint automatically.
-  let res = await fetch(`${OLLAMA_URL}/api/embed`, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ model: OLLAMA_EMBED_MODEL, input: text }),
-  });
+  const ctrl1 = new AbortController();
+  const t1 = setTimeout(() => ctrl1.abort(), EMBED_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(`${OLLAMA_URL}/api/embed`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ model: OLLAMA_EMBED_MODEL, input: text }),
+      signal:  ctrl1.signal,
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') throw new Error(`Ollama embed timed out after ${EMBED_TIMEOUT_MS / 1000}s`);
+    throw err;
+  } finally {
+    clearTimeout(t1);
+  }
 
   if (res.status === 404) {
     // Older Ollama — fall back to legacy endpoint
-    res = await fetch(`${OLLAMA_URL}/api/embeddings`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ model: OLLAMA_EMBED_MODEL, prompt: text }),
-    });
+    const ctrl2 = new AbortController();
+    const t2 = setTimeout(() => ctrl2.abort(), EMBED_TIMEOUT_MS);
+    try {
+      res = await fetch(`${OLLAMA_URL}/api/embeddings`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ model: OLLAMA_EMBED_MODEL, prompt: text }),
+        signal:  ctrl2.signal,
+      });
+    } catch (err) {
+      if (err.name === 'AbortError') throw new Error(`Ollama embed timed out after ${EMBED_TIMEOUT_MS / 1000}s`);
+      throw err;
+    } finally {
+      clearTimeout(t2);
+    }
   }
 
   if (!res.ok) {
