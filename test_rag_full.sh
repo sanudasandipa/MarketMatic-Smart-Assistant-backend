@@ -55,5 +55,5 @@ echo ""
 echo "================================================"
 echo " 6. Verify ChromaDB has vectors"
 echo "================================================"
-CHROMA=$(curl -s http://localhost:8001/api/v2/collections 2>/dev/null)
+CHROMA=$(curl -s http://localhost:8001/api/v2/tenants/default_tenant/databases/default_database/collections 2>/dev/null)
 echo "  ChromaDB collections: ${CHROMA:0:300}"

@@ -36,8 +36,16 @@ services:
       - "8001:8000"   # chroma listens on 8000 internally; exposed as 8001 on host
     networks:
       - app_net
+    healthcheck:
+      # Rust-based ChromaDB image has only bash (no curl/wget/python).
+      # Use bash /dev/tcp to check the port is accepting connections.
+      test: ["CMD-SHELL", "bash -c 'echo >/dev/tcp/localhost/8000' 2>/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
-  # ── Ollama (embedding model server) ───────────────────────────────────────
+  # ── Ollama (embedding + chat model server) ────────────────────────────────
   ollama:
     image: ollama/ollama:latest
     container_name: smart_assistant_ollama
@@ -53,6 +61,23 @@ services:
       retries: 10
       start_period: 30s
 
+  # ── Ollama model initialiser (runs once; pulls phi3 + nomic-embed-text) ───
+  # Waits for the ollama service to be healthy, then pulls both required models
+  # into the shared ollama_data volume.  Skips silently if already cached.
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: smart_assistant_ollama_init
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - app_net
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c",
+      "ollama pull phi3 && ollama pull nomic-embed-text && echo '✅ Models ready'"]
+
   # ── Node.js Backend ────────────────────────────────────────────────────────
   backend:
     build:
@@ -65,18 +90,30 @@ services:
       mongo:
         condition: service_healthy
       chroma:
-        condition: service_started
+        condition: service_healthy
       ollama:
         condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
     env_file:
       - .env
     environment:
       NODE_ENV: production
       PORT: 8000
-      # Override URLs to use Docker service names instead of localhost
-      MONGO_URI: ${MONGO_URI}
+      # Construct MongoDB URI using service name so it works inside the Docker network.
+      # This overrides any localhost-based MONGO_URI that might be in the .env file.
+      MONGO_URI: mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASS:-changeme}@mongo:27017/smart_assistant?authSource=admin
       CHROMA_URL: http://chroma:8000
       OLLAMA_URL: http://ollama:11434
+      # Explicitly pin model names so both ragService and warmup use the same model
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-phi3}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      # Groq cloud fallback — leave blank to disable
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-8b-instant}
+      # RAG tuning
+      RAG_RELEVANCE_THRESHOLD: ${RAG_RELEVANCE_THRESHOLD:-0.50}
+      OLLAMA_TIMEOUT_MS: ${OLLAMA_TIMEOUT_MS:-60000}
     ports:
       - "8000:8000"
     networks:

@@ -77,11 +77,12 @@ function parseChromaUrl() {
   return { host: url.hostname, port: parseInt(url.port || '8001', 10) };
 }
 
-/** Returns true if ChromaDB is already accepting HTTP connections */
+/** Returns true if ChromaDB is already accepting HTTP connections (using v2 API) */
 function isChromaUp() {
   return new Promise((resolve) => {
     const { host, port } = parseChromaUrl();
-    const req = http.get({ host, port, path: '/api/v1/heartbeat', timeout: 2000 }, (res) => {
+    // ChromaDB >= 0.6 (Rust) deprecated /api/v1 — use /api/v2/heartbeat
+    const req = http.get({ host, port, path: '/api/v2/heartbeat', timeout: 2000 }, (res) => {
       resolve(res.statusCode < 500);
     });
     req.on('error', () => resolve(false));

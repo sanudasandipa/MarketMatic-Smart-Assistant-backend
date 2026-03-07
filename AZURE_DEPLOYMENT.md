@@ -115,28 +115,49 @@ nano .env
 Fill in the values:
 
 ```env
-# Server
+# ── Server ────────────────────────────────────────────────────────────────────
 PORT=8000
 NODE_ENV=production
 
-# MongoDB credentials (must match docker-compose.yml)
+# ── MongoDB credentials (must match docker-compose.yml) ──────────────────────
 MONGO_ROOT_USER=admin
 MONGO_ROOT_PASS=<a-strong-password>
+MONGO_URI=mongodb://admin:<a-strong-password>@mongo:27017/smart_assistant?authSource=admin
 
-# JWT
+# ── JWT ──────────────────────────────────────────────────────────────────────
 JWT_SECRET=<a-long-random-secret-minimum-32-chars>
 JWT_EXPIRES_IN=7d
 
-# Frontend origin (your Next.js URL or Azure static web app URL)
+# ── Frontend origin (your Next.js URL or Azure Static Web App URL) ────────────
 FRONTEND_URL=https://<your-frontend-domain>
 
-# Superadmin seed (run once then you can remove these)
+# ── Ollama — docker-compose overrides the URL to http://ollama:11434 ──────────
+# These values tell the backend WHICH models to use.
+# The ollama-init service will auto-pull them on first deploy.
+OLLAMA_CHAT_MODEL=phi3
+OLLAMA_EMBED_MODEL=nomic-embed-text
+# Increase timeout for cold starts on CPU-only VMs (phi3 can take 60–120 s)
+OLLAMA_TIMEOUT_MS=120000
+
+# ── Groq API (cloud LLM fallback — used when Ollama is unavailable) ──────────
+# Get a free key at https://console.groq.com
+# Leave blank to use Ollama only.
+GROQ_API_KEY=<your-groq-api-key-or-leave-blank>
+GROQ_MODEL=llama-3.1-8b-instant
+
+# ── RAG tuning ────────────────────────────────────────────────────────────────
+RAG_RELEVANCE_THRESHOLD=0.50
+
+# ── Superadmin seed (run once then you can remove these) ─────────────────────
 SUPERADMIN_EMAIL=superadmin@platform.com
 SUPERADMIN_PASSWORD=SuperAdmin@2024
 SUPERADMIN_NAME=Platform Superadmin
 ```
 
 Save and exit (`Ctrl+O`, `Enter`, `Ctrl+X`).
+
+> **Important:** `MONGO_URI` must match `MONGO_ROOT_USER` / `MONGO_ROOT_PASS` above.
+> The docker-compose `MONGO_URI` override uses the service name `mongo` — not `localhost`.
 
 ---
 
@@ -147,13 +168,37 @@ Save and exit (`Ctrl+O`, `Enter`, `Ctrl+X`).
 docker compose up -d --build
 ```
 
-Check that all containers are healthy:
+Docker will start services in the correct order:
+1. `mongo` and `chroma` start first
+2. `ollama` starts and becomes healthy
+3. `ollama-init` runs and **auto-pulls `phi3` + `nomic-embed-text`** into the shared volume
+4. `backend` starts only after all of the above are ready
+
+> **Note:** The first deploy takes extra time because `phi3` (~2.2 GB) and `nomic-embed-text`
+> (~270 MB) must be downloaded. This only happens once; subsequent restarts use the cached
+> `ollama_data` volume.
+
+Check that all containers are up:
 
 ```bash
 docker compose ps
 ```
 
-You should see `healthy` for all three services.
+Watch the model download in real time:
+
+```bash
+docker compose logs -f ollama-init
+```
+
+Verify both models are present once `ollama-init` exits:
+
+```bash
+docker exec smart_assistant_ollama ollama list
+# Expected output:
+# NAME                      ID            SIZE   MODIFIED
+# nomic-embed-text:latest   ...           ...    ...
+# phi3:latest               ...           ...    ...
+```
 
 ---
 
@@ -176,6 +221,13 @@ Expected response:
 {"status":"ok","service":"smart-assistant-backend","timestamp":"..."}
 ```
 
+Test RAG end-to-end (replace `<TENANT_ID>` with a real tenant):
+```bash
+curl -s -X POST http://<VM_PUBLIC_IP>:8000/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"tenantId":"<TENANT_ID>","message":"hello"}'
+```
+
 ---
 
 ## Useful commands
@@ -187,13 +239,20 @@ docker compose logs -f
 # Logs for a specific service
 docker compose logs -f backend
 
+# Check which Ollama models are loaded
+docker exec smart_assistant_ollama ollama list
+
+# Manually re-pull a model (e.g. after a volume reset)
+docker exec smart_assistant_ollama ollama pull phi3
+docker exec smart_assistant_ollama ollama pull nomic-embed-text
+
 # Restart a service
 docker compose restart backend
 
-# Stop everything
+# Stop everything (preserves volumes / data)
 docker compose down
 
-# Stop and remove volumes (WARNING: deletes all data)
+# Stop and remove volumes (WARNING: deletes ALL ChromaDB + MongoDB data)
 docker compose down -v
 
 # Pull latest images and redeploy
@@ -245,6 +304,9 @@ sudo certbot --nginx -d api.yourdomain.com
 | Symptom | Fix |
 |---|---|
 | `backend` container keeps restarting | Run `docker compose logs backend` to see the error |
-| MongoDB connection refused | Check `MONGO_ROOT_USER`/`MONGO_ROOT_PASS` match in `.env` and `docker-compose.yml` |
+| MongoDB connection refused | Check `MONGO_ROOT_USER`/`MONGO_ROOT_PASS` match in `.env` and `docker-compose.yml`; `MONGO_URI` must use service name `mongo` not `localhost` |
 | ChromaDB unhealthy | Run `docker compose logs chroma`; make sure `chroma_data` volume has write permissions |
 | Port 8000 not reachable | Verify NSG inbound rule for port 8000 is added in Azure Portal |
+| RAG says "I don't have that info" every time | Run `docker exec smart_assistant_ollama ollama list` — if `nomic-embed-text` is missing, embeddings fail silently; re-run `ollama-init`: `docker compose up ollama-init` |
+| Ollama warm-up timeout in logs | VM is CPU-only; increase `OLLAMA_TIMEOUT_MS` to `120000` in `.env` and `docker compose restart backend` |
+| Chat answer is wrong/hallucinated | Admin has not yet uploaded documents for that tenant; use the admin dashboard to upload a PDF/DOCX/TXT knowledge base |

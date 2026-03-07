@@ -18,7 +18,7 @@ const { queryCollection }  = require('./chromaService');
 
 // Local Ollama (primary) — runs entirely offline, zero cost
 const OLLAMA_URL         = process.env.OLLAMA_URL         || 'http://localhost:11434';
-const OLLAMA_CHAT_MODEL  = process.env.OLLAMA_CHAT_MODEL  || 'llama3';
+const OLLAMA_CHAT_MODEL  = process.env.OLLAMA_CHAT_MODEL  || 'phi3';   // must match the model pulled in Ollama
 // Max ms to wait for Ollama before falling through to cloud fallback (default 25 s)
 const OLLAMA_TIMEOUT_MS  = parseInt(process.env.OLLAMA_TIMEOUT_MS || '25000', 10);
 
