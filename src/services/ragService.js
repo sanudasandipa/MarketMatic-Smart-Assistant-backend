@@ -27,8 +27,10 @@ const GROQ_MODEL     = process.env.GROQ_MODEL     || 'llama-3.1-8b-instant';
 const GROQ_API_URL   = 'https://api.groq.com/openai/v1/chat/completions';
 
 // Cosine distance threshold: chunks with distance > this are considered irrelevant.
-// Cosine distance is in [0, 2]; practically relevant matches are usually < 0.45.
-const RELEVANCE_THRESHOLD = parseFloat(process.env.RAG_RELEVANCE_THRESHOLD || '0.50');
+// Cosine distance is in [0, 2]; practically relevant matches are usually < 0.65.
+// 0.65 is generous enough to handle natural language question variation while still
+// filtering out genuinely unrelated chunks (which typically score > 0.70).
+const RELEVANCE_THRESHOLD = parseFloat(process.env.RAG_RELEVANCE_THRESHOLD || '0.65');
 
 // ─── System prompt builder ───────────────────────────────────────────────────
 
