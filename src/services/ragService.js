@@ -2,25 +2,27 @@
  * RAG (Retrieval-Augmented Generation) Service
  *
  * Architecture:
- *  1. Embed the user's question via local Ollama nomic-embed-text
- *  2. Query the tenant's ChromaDB vector collection for the top-k relevant chunks
- *  3. Build a context-aware prompt that includes retrieved knowledge
- *  4. Call local Ollama llama3 for the answer  (primary — offline, zero cost)
- *  5. Auto-failover to Groq API               (cloud fallback, if Ollama fails)
- *  6. Return { answer, model, sources, confidence }
+ *  1. Embed the user's question via local Ollama bge-m3 (1024-dim, multilingual)
+ *  2. Query the tenant's ChromaDB vector collection for top-10 relevant chunks
+ *  3. Rerank chunks with bge-reranker cross-encoder → keep top 5
+ *  4. Build a context-aware prompt that includes retrieved knowledge
+ *  5. Call local Ollama phi3 for the answer   (primary — offline, zero cost)
+ *  6. Auto-failover to Groq API              (cloud fallback, if Ollama fails)
+ *  7. Return { answer, model, sources, confidence }
  *
  * Multi-tenant isolation: every query is strictly scoped to the store's
  * ChromaDB collection — no cross-tenant data leakage is possible.
  */
 
 const { getEmbedding }     = require('./embeddingService');
-const { queryCollection }  = require('./chromaService');
+const { queryCollection, getChunksById }  = require('./chromaService');
+const { rerank }           = require('./rerankerService');
 
 // Local Ollama (primary) — runs entirely offline, zero cost
 const OLLAMA_URL         = process.env.OLLAMA_URL         || 'http://localhost:11434';
 const OLLAMA_CHAT_MODEL  = process.env.OLLAMA_CHAT_MODEL  || 'phi3';   // must match the model pulled in Ollama
-// Max ms to wait for Ollama before falling through to cloud fallback (default 25 s)
-const OLLAMA_TIMEOUT_MS  = parseInt(process.env.OLLAMA_TIMEOUT_MS || '25000', 10);
+// Max ms to wait for Ollama before falling through to cloud fallback (default 60 s)
+const OLLAMA_TIMEOUT_MS  = parseInt(process.env.OLLAMA_TIMEOUT_MS || '60000', 10);
 
 const GROQ_API_KEY   = process.env.GROQ_API_KEY   || '';
 const GROQ_MODEL     = process.env.GROQ_MODEL     || 'llama-3.1-8b-instant';
@@ -67,7 +69,8 @@ function buildSystemPrompt(
   knowledgeSource   = 'store',
   storeCategory     = '',
   assistantTone     = 'professional',
-  assistantLanguage = 'en'
+  assistantLanguage = 'en',
+  questionHint      = ''
 ) {
   // ── Tone instruction ────────────────────────────────────────────────────────
   const toneMap = {
@@ -113,17 +116,21 @@ function buildSystemPrompt(
   }
 
   // ── Store-knowledge mode ───────────────────────────────────────────────────
+  // With reranked 400-char chunks, each chunk is focused on a single topic.
+  // No need for keyword extraction hacks — just present the context clearly.
   const contextBlock = chunks
-    .map((c, i) => `(${i + 1}) ${c.document}`)
+    .map((c, i) => `[${i + 1}] ${c.document}`)
     .join('\n\n');
 
   return (
     `${basePersona} ` +
-    `Answer the customer's question using only the store information provided below. ` +
-    `Do not speculate beyond what the information contains. ` +
-    `If the answer is not present, say: "I don't have that specific information in ${storeName}'s records. Please contact the store directly for details." ` +
-    `Keep answers concise and helpful.` +
-    `\n\nStore knowledge:\n${contextBlock}`
+    `Answer the customer's question using ONLY the store data below.\n` +
+    `RULES:\n` +
+    `1. Find the relevant product, service, or topic in the data below.\n` +
+    `2. Include EXACT prices, sizes, times, or names from the data.\n` +
+    `3. Be concise and helpful.\n` +
+    `4. Only say "I don't have that information" if truly not in the data.\n` +
+    `\n--- STORE DATA ---\n${contextBlock}\n--- END ---`
   );
 }
 
@@ -151,6 +158,7 @@ async function callOllama(messages) {
         model:  OLLAMA_CHAT_MODEL,
         messages,
         stream: false,
+        options: { temperature: 0.3 },
       }),
     });
   } catch (err) {
@@ -205,6 +213,33 @@ async function callGroq(messages) {
   return data.choices?.[0]?.message?.content || '';
 }
 
+// ─── Query Enhancement ────────────────────────────────────────────────────────
+
+/**
+ * Detect when the user sends a bare product/item name (no question word)
+ * and rephrase it as a proper question. This dramatically improves both
+ * embedding retrieval quality AND small-LLM comprehension (phi3 especially).
+ *
+ * Examples:
+ *   "Pure Coconut Oil 100ml"  → "What is the price and details of Pure Coconut Oil 100ml?"
+ *   "opening hours"           → "What are the opening hours?"
+ *   "Maldive fish"            → "What is the price and details of Maldive fish?"
+ *   "do you have goraka?"     → (unchanged — already a question)
+ */
+function enhanceQuery(raw) {
+  const trimmed = raw.trim();
+  // Already a question or longer conversational sentence — leave as-is
+  if (/^(what|where|when|who|how|which|is |are |do |does |can |could |will |would |tell |show |give |list |find )/i.test(trimmed)) {
+    return trimmed;
+  }
+  // Very short (likely a product name, topic, or keyword search)
+  const wordCount = trimmed.split(/\s+/).length;
+  if (wordCount <= 8 && !trimmed.includes('?')) {
+    return `What is the price, availability, and details of ${trimmed}?`;
+  }
+  return trimmed;
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
@@ -222,6 +257,13 @@ async function callGroq(messages) {
  * @returns {Promise<{answer:string, model:string, sources:Array}>}
  */
 async function ragQuery({ question, context = [], tenantId, storeName, storeCategory = '', assistantTone = 'professional', assistantLanguage = 'en' }) {
+  // ── Step 0: Enhance short/product-name-only queries ─────────────────────────
+  // Small LLMs (phi3) struggle when the user sends just a product name.
+  // Detect this and rephrase as a proper question for better LLM comprehension.
+  // IMPORTANT: We use the ORIGINAL question for embedding/retrieval (better vector match)
+  // and the ENHANCED question only for the LLM prompt.
+  const enhancedQuestion = enhanceQuery(question);
+
   // ── Step 1: Embed the question ──────────────────────────────────────────────
   let questionEmbedding = null;
   let chromaChunks = [];
@@ -233,23 +275,28 @@ async function ragQuery({ question, context = [], tenantId, storeName, storeCate
     console.warn('⚠️  Embedding failed, skipping RAG retrieval:', err.message);
   }
 
-  // ── Step 2: Retrieve relevant chunks from ChromaDB ─────────────────────────
+  // ── Step 2: Retrieve top-K chunks from ChromaDB  ────────────────────────────
+  // Retrieve a generous set (topK=10) then let the reranker pick the best ones.
+  const TOP_K = 10;
+  const RERANK_TOP_N = 5;  // keep top 5 after reranking
+
   if (questionEmbedding && tenantId) {
     try {
-      const results = await queryCollection(tenantId, questionEmbedding, 5);
+      const results = await queryCollection(tenantId, questionEmbedding, TOP_K);
       // results shape: { ids, documents, metadatas, distances }
+      const ids       = results.ids?.[0]        || [];
       const docs      = results.documents?.[0]  || [];
       const metadatas = results.metadatas?.[0]  || [];
       const distances = results.distances?.[0]  || [];
 
       const rawChunks = docs.map((doc, i) => ({
+        id:       ids[i],
         document: doc,
         metadata: metadatas[i] || {},
         distance: distances[i],
       }));
 
-      // Keep only chunks that meet the relevance threshold.
-      // Log so operators can tune RELEVANCE_THRESHOLD if needed.
+      // Light pre-filter: discard chunks with very high cosine distance
       chromaChunks = rawChunks.filter((c) => c.distance <= RELEVANCE_THRESHOLD);
 
       if (rawChunks.length > 0 && chromaChunks.length === 0) {
@@ -258,11 +305,17 @@ async function ragQuery({ question, context = [], tenantId, storeName, storeCate
           `(threshold=${RELEVANCE_THRESHOLD}, best distance=${rawChunks[0].distance?.toFixed(3)}). ` +
           `Falling back to general knowledge.`
         );
-      } else if (chromaChunks.length > 0) {
-        console.info(
-          `✅  Retrieval: ${chromaChunks.length}/${rawChunks.length} chunks passed relevance ` +
-          `threshold (threshold=${RELEVANCE_THRESHOLD}).`
-        );
+      } else {
+        console.info(`📥  Retrieved ${chromaChunks.length}/${rawChunks.length} chunks passing threshold ${RELEVANCE_THRESHOLD}`);
+      }
+
+      // ── Step 2b: Cross-encoder reranking ──────────────────────────────────
+      // The reranker is far more accurate than cosine-distance alone.
+      // It examines each (query, chunk) pair with a cross-encoder to determine
+      // true relevance, eliminating false-positives from embedding retrieval.
+      if (chromaChunks.length > 0) {
+        chromaChunks = await rerank(enhancedQuestion, chromaChunks, RERANK_TOP_N);
+        console.info(`✅  After reranking: ${chromaChunks.length} chunks passed to LLM`);
       }
     } catch (err) {
       // ChromaDB might not have a collection yet (no documents uploaded)
@@ -272,7 +325,7 @@ async function ragQuery({ question, context = [], tenantId, storeName, storeCate
 
   // ── Step 3: Determine knowledge source & build the full message array ────────
   const knowledgeSource = chromaChunks.length > 0 ? 'store' : 'general';
-  const systemPrompt    = buildSystemPrompt(chromaChunks, storeName, knowledgeSource, storeCategory, assistantTone, assistantLanguage);
+  const systemPrompt    = buildSystemPrompt(chromaChunks, storeName, knowledgeSource, storeCategory, assistantTone, assistantLanguage, enhancedQuestion);
 
   // Trim conversation history to last N exchanges to stay within context window
   const MAX_HISTORY = 10;
@@ -281,7 +334,7 @@ async function ragQuery({ question, context = [], tenantId, storeName, storeCate
   const messages = [
     { role: 'system', content: systemPrompt },
     ...trimmedHistory,
-    { role: 'user', content: question },
+    { role: 'user', content: enhancedQuestion },
   ];
 
   // ── Step 4: Ollama (local) → Groq (cloud) failover chain ─────────────────────
@@ -310,8 +363,9 @@ async function ragQuery({ question, context = [], tenantId, storeName, storeCate
   }
 
   // Confidence = highest relevance score across retrieved chunks (null when general-knowledge mode)
-  const confidence = chromaChunks.length > 0
-    ? parseFloat(Math.max(...chromaChunks.map((c) => 1 - (c.distance ?? 1))).toFixed(3))
+  const scoredChunks = chromaChunks.filter(c => c.distance != null);
+  const confidence = scoredChunks.length > 0
+    ? parseFloat(Math.max(...scoredChunks.map((c) => 1 - (c.distance ?? 1))).toFixed(3))
     : null;
 
   return {

@@ -76,7 +76,7 @@ services:
     environment:
       OLLAMA_HOST: http://ollama:11434
     entrypoint: ["/bin/sh", "-c",
-      "ollama pull phi3 && ollama pull nomic-embed-text && echo '✅ Models ready'"]
+      "ollama pull phi3 && ollama pull bge-m3 && echo '✅ Models ready'"]
 
   # ── Node.js Backend ────────────────────────────────────────────────────────
   backend:
@@ -104,16 +104,16 @@ services:
       # This overrides any localhost-based MONGO_URI that might be in the .env file.
       MONGO_URI: mongodb://${MONGO_ROOT_USER:-admin}:${MONGO_ROOT_PASS:-changeme}@mongo:27017/smart_assistant?authSource=admin
       CHROMA_URL: http://chroma:8000
-      OLLAMA_URL: http://ollama:11434
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       # Explicitly pin model names so both ragService and warmup use the same model
       OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-phi3}
-      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-bge-m3}
       # Groq cloud fallback — leave blank to disable
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-8b-instant}
       # RAG tuning
-      RAG_RELEVANCE_THRESHOLD: ${RAG_RELEVANCE_THRESHOLD:-0.65}
-      OLLAMA_TIMEOUT_MS: ${OLLAMA_TIMEOUT_MS:-60000}
+      RAG_RELEVANCE_THRESHOLD: ${RAG_RELEVANCE_THRESHOLD:-0.50}
+      OLLAMA_TIMEOUT_MS: ${OLLAMA_TIMEOUT_MS:-200000}
     ports:
       - "8000:8000"
     networks:

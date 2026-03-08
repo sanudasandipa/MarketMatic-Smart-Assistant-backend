@@ -122,4 +122,41 @@ async function queryCollection(tenantId, queryVector, nResults = 5) {
   });
 }
 
-module.exports = { getOrCreateCollection, upsertChunks, deleteDocumentChunks, queryCollection };
+/**
+ * Fetch specific chunks by their IDs (used for adjacent-chunk retrieval).
+ *
+ * @param {string}   tenantId - store namespace
+ * @param {string[]} ids      - ChromaDB IDs to fetch
+ */
+async function getChunksById(tenantId, ids) {
+  if (!ids || ids.length === 0) return { ids: [], documents: [], metadatas: [] };
+  const collection = await getOrCreateCollection(tenantId);
+  return collection.get({
+    ids,
+    include: ['documents', 'metadatas'],
+  });
+}
+
+/**
+ * Fetch ALL chunks from a tenant's collection (for keyword fallback / re-embed).
+ */
+async function getAllChunks(tenantId) {
+  const collection = await getOrCreateCollection(tenantId);
+  return collection.get({ include: ['documents', 'metadatas'] });
+}
+
+/**
+ * Delete an entire tenant collection (used when re-embedding with a new model).
+ */
+async function deleteCollection(tenantId) {
+  const client = getClient();
+  try {
+    await client.deleteCollection({ name: tenantId });
+    console.log(`🗑️  Deleted ChromaDB collection: ${tenantId}`);
+  } catch (err) {
+    if (err.message?.includes('does not exist')) return;
+    throw err;
+  }
+}
+
+module.exports = { getOrCreateCollection, upsertChunks, deleteDocumentChunks, queryCollection, getChunksById, getAllChunks, deleteCollection };

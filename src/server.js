@@ -63,6 +63,9 @@ app.listen(PORT, async () => {
   // Pre-warm the Ollama chat model so the first real request isn't blocked by
   // cold-load time (phi3 is 2.2 GB and takes 30-60 s on CPU from cold).
   warmUpOllama();
+  // Pre-load the reranker model (downloads ONNX weights on first run, ~110 MB)
+  const { warmupReranker } = require('./services/rerankerService');
+  warmupReranker().catch(err => console.warn('⚠️  Reranker warmup error:', err.message));
 });
 
 /**

@@ -2,47 +2,84 @@
  * Embedding service – text extraction, chunking, and Ollama embedding.
  *
  * Supported file types: PDF, DOCX, TXT
- * Embedding model:      nomic-embed-text (via local Ollama)
+ * Embedding model:      bge-m3 (via local Ollama) — 1024-dim, multilingual
  *
  * Ollama must be running: ollama serve
- * Model must be pulled:   ollama pull nomic-embed-text
+ * Model must be pulled:   ollama pull bge-m3
  */
 
 const OLLAMA_URL        = process.env.OLLAMA_URL        || 'http://localhost:11434';
-const OLLAMA_EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || 'nomic-embed-text';
+const OLLAMA_EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || 'bge-m3';
 
 // Remote embedding fallback — any OpenAI-compatible /v1/embeddings endpoint.
 // E.g. a second Ollama on a VPS, or a self-hosted FastEmbed server.
 // Set REMOTE_EMBED_URL and REMOTE_EMBED_MODEL in .env to enable.
 const REMOTE_EMBED_URL   = process.env.REMOTE_EMBED_URL   || '';
-const REMOTE_EMBED_MODEL = process.env.REMOTE_EMBED_MODEL || 'nomic-embed-text';
+const REMOTE_EMBED_MODEL = process.env.REMOTE_EMBED_MODEL || 'bge-m3';
 const REMOTE_EMBED_KEY   = process.env.REMOTE_EMBED_KEY   || '';
 
 // ─── Chunking config ──────────────────────────────────────────────────────────
-const CHUNK_SIZE    = 500;  // characters per chunk
+const CHUNK_SIZE    = 400;  // characters per chunk — smaller = more precise retrieval
 const CHUNK_OVERLAP = 100;  // overlap between consecutive chunks
 const MIN_CHUNK_LEN =  30;  // discard chunks shorter than this
 
 /**
- * Split a long string into overlapping chunks for better RAG retrieval.
+ * Split text into paragraph-aware overlapping chunks for better RAG retrieval.
+ *
+ * Strategy: split into paragraphs first, then merge paragraphs into chunks
+ * up to CHUNK_SIZE. This avoids splitting mid-section (e.g. opening hours,
+ * pricing tables) which confuses smaller LLMs.
  */
 function chunkText(text) {
-  // Normalise whitespace
-  const cleaned = text.replace(/\s+/g, ' ').trim();
+  // Split into paragraphs on double-newlines or section dividers (=== / ---)
+  const paragraphs = text
+    .split(/\n{2,}|(?=={3,})|(?=-{3,})/)
+    .map(p => p.replace(/\s+/g, ' ').trim())
+    .filter(p => p.length >= MIN_CHUNK_LEN);
 
-  const chunks = [];
-  let start = 0;
-
-  while (start < cleaned.length) {
-    const end   = Math.min(start + CHUNK_SIZE, cleaned.length);
-    const chunk = cleaned.slice(start, end).trim();
-    if (chunk.length >= MIN_CHUNK_LEN) {
-      chunks.push(chunk);
-    }
-    start += CHUNK_SIZE - CHUNK_OVERLAP;
+  // If paragraph splitting produced nothing useful, fall back to cleaned text
+  if (paragraphs.length === 0) {
+    const cleaned = text.replace(/\s+/g, ' ').trim();
+    if (cleaned.length < MIN_CHUNK_LEN) return [];
+    paragraphs.push(cleaned);
   }
 
-  return chunks;
+  const chunks = [];
+  let current = '';
+
+  for (const para of paragraphs) {
+    // If adding this paragraph exceeds chunk size, flush current chunk
+    if (current.length > 0 && current.length + para.length + 1 > CHUNK_SIZE) {
+      chunks.push(current.trim());
+      // Keep overlap from the end of the current chunk
+      const overlapStart = Math.max(0, current.length - CHUNK_OVERLAP);
+      current = current.slice(overlapStart).trim();
+    }
+    current += (current.length > 0 ? ' ' : '') + para;
+  }
+
+  // Flush remaining text
+  if (current.trim().length >= MIN_CHUNK_LEN) {
+    chunks.push(current.trim());
+  }
+
+  // Safety: if a single paragraph is larger than CHUNK_SIZE, split it with sliding window
+  const final = [];
+  for (const chunk of chunks) {
+    if (chunk.length <= CHUNK_SIZE) {
+      final.push(chunk);
+    } else {
+      let start = 0;
+      while (start < chunk.length) {
+        const end = Math.min(start + CHUNK_SIZE, chunk.length);
+        const sub = chunk.slice(start, end).trim();
+        if (sub.length >= MIN_CHUNK_LEN) final.push(sub);
+        start += CHUNK_SIZE - CHUNK_OVERLAP;
+      }
+    }
+  }
+
+  return final;
 }
 
 /**
@@ -99,7 +136,7 @@ async function getEmbedding(text) {
  * Ollama embedding (primary — offline, zero cost).
  */
 async function _ollamaEmbed(text) {
-  const EMBED_TIMEOUT_MS = 35000; // 35s — enough for warm response, aborts on cold start
+  const EMBED_TIMEOUT_MS = parseInt(process.env.EMBED_TIMEOUT_MS || '120000', 10); // default 120s — allows for Modal cold start
   // Try the modern /api/embed endpoint first (Ollama 0.1.26+)
   // Falls back to the legacy /api/embeddings endpoint automatically.
   const ctrl1 = new AbortController();
