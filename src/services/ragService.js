@@ -126,11 +126,13 @@ function buildSystemPrompt(
     `${basePersona} ` +
     `Answer the customer's question using ONLY the store data below.\n` +
     `RULES:\n` +
-    `1. Read ALL the store data sections carefully before answering.\n` +
-    `2. If the answer is anywhere in the data, provide it with EXACT details (prices, sizes, times, names, URLs).\n` +
-    `3. Structure your response clearly: use **bold** for product names and key values, bullet points for lists of items or features, and short paragraphs. Aim for a thorough, professional response.\n` +
-    `4. NEVER say "I don't have that information" if the data below contains anything related to the question.\n` +
-    `5. Only say you cannot help if the data truly contains NOTHING relevant.\n` +
+    `1. Read ALL store data sections carefully before writing a single word of your answer.\n` +
+    `2. Include EVERY relevant fact — prices, sizes, dates, URLs, product IDs, availability, policies — verbatim. Do NOT summarise or omit any specific value that appears in the data.\n` +
+    `3. If multiple data sections are relevant, list each one separately using bullet points or sub-headings. Do not collapse separate items into a single vague sentence.\n` +
+    `4. Format: **bold** for product names, prices, and key values; bullet lists for multiple items; short focused paragraphs for descriptions.\n` +
+    `5. NEVER say "I don't have that information" if ANY section below contains relevant content.\n` +
+    `6. If the data contains NOTHING relevant to the question, say exactly: "ℹ️ I could not find exact information in the provided store data." Then offer general guidance without inventing specifics.\n` +
+    `7. At the very end of your response add a line: Sources: [list the chunk numbers you used, e.g. [1], [3]]\n` +
     `\n--- STORE DATA ---\n${contextBlock}\n--- END ---`
   );
 }
@@ -278,7 +280,7 @@ async function ragQuery({ question, context = [], tenantId, storeName, storeCate
 
   // ── Step 2: Retrieve top-K chunks from ChromaDB ─────────────────────────────
   const TOP_K = 10;
-  const MAX_CHUNKS_TO_LLM = 7;  // send at most 7 best chunks to the LLM
+  const MAX_CHUNKS_TO_LLM = 10;  // send at most 10 best chunks to the LLM
 
   if (questionEmbedding && tenantId) {
     try {
