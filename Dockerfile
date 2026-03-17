@@ -1,5 +1,5 @@
 # ── Stage 1: Dependencies ─────────────────────────────────────────────────────
-FROM node:20-alpine AS deps
+FROM node:20-slim AS deps
 
 WORKDIR /app
 
@@ -8,12 +8,15 @@ COPY package*.json ./
 RUN npm install --omit=dev --no-audit --no-fund
 
 # ── Stage 2: Production image ─────────────────────────────────────────────────
-FROM node:20-alpine AS runner
+FROM node:20-slim AS runner
 
 WORKDIR /app
 
+# Install wget for healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends wget && rm -rf /var/lib/apt/lists/*
+
 # Create a non-root user for security
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+RUN groupadd --system appgroup && useradd --system --gid appgroup appuser
 
 # Copy installed node_modules from deps stage
 COPY --from=deps /app/node_modules ./node_modules

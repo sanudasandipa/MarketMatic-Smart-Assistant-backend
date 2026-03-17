@@ -1,23 +1,24 @@
-/**
+﻿/**
  * RAG (Retrieval-Augmented Generation) Service
  *
  * Architecture:
- *  1. Embed the user's question via Ollama (nomic-embed-text)
- *  2. Query the tenant's ChromaDB vector collection for top-K relevant chunks
- *  3. Filter by cosine distance threshold, keep top 5 closest
+ *  1. Embed the user's question via local Ollama bge-m3 (1024-dim, multilingual)
+ *  2. Query the tenant's ChromaDB vector collection for top-10 relevant chunks
+ *  3. Rerank chunks with bge-reranker cross-encoder ΓåÆ keep top 5
  *  4. Build a context-aware prompt that includes retrieved knowledge
- *  5. Call Ollama phi3 for the answer         (primary — zero cost)
+ *  5. Call local Ollama phi3 for the answer   (primary ΓÇö offline, zero cost)
  *  6. Auto-failover to Groq API              (cloud fallback, if Ollama fails)
  *  7. Return { answer, model, sources, confidence }
  *
  * Multi-tenant isolation: every query is strictly scoped to the store's
- * ChromaDB collection — no cross-tenant data leakage is possible.
+ * ChromaDB collection ΓÇö no cross-tenant data leakage is possible.
  */
 
 const { getEmbedding }     = require('./embeddingService');
 const { queryCollection, getChunksById }  = require('./chromaService');
+const { rerank }           = require('./rerankerService');
 
-// Local Ollama (primary) — runs entirely offline, zero cost
+// Local Ollama (primary) ΓÇö runs entirely offline, zero cost
 const OLLAMA_URL         = process.env.OLLAMA_URL         || 'http://localhost:11434';
 const OLLAMA_CHAT_MODEL  = process.env.OLLAMA_CHAT_MODEL  || 'phi3';   // must match the model pulled in Ollama
 // Max ms to wait for Ollama before falling through to cloud fallback (default 60 s)
@@ -28,14 +29,14 @@ const GROQ_MODEL     = process.env.GROQ_MODEL     || 'llama-3.1-8b-instant';
 const GROQ_API_URL   = 'https://api.groq.com/openai/v1/chat/completions';
 
 // Cosine distance threshold: chunks with distance > this are considered irrelevant.
-// Cosine distance is in [0, 2]; practically relevant matches are usually < 0.75.
-// 0.75 is generous enough to capture broader topic matches while still
-// filtering out genuinely unrelated chunks (which typically score > 0.80).
-const RELEVANCE_THRESHOLD = parseFloat(process.env.RAG_RELEVANCE_THRESHOLD || '0.75');
+// Cosine distance is in [0, 2]; practically relevant matches are usually < 0.65.
+// 0.65 is generous enough to handle natural language question variation while still
+// filtering out genuinely unrelated chunks (which typically score > 0.70).
+const RELEVANCE_THRESHOLD = parseFloat(process.env.RAG_RELEVANCE_THRESHOLD || '0.65');
 
-// ─── System prompt builder ───────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ System prompt builder ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-// ─── Domain-to-persona mapping ────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Domain-to-persona mapping ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Maps storeCategory values to domain-specific assistant behaviour instructions.
 const DOMAIN_GUIDANCE = {
   pharmacy:    'You assist customers with medicine availability, dosage info (non-prescription), health products, and pharmacy services. Always recommend consulting a licensed pharmacist or doctor for medical decisions.',
@@ -51,8 +52,8 @@ const DOMAIN_GUIDANCE = {
 /**
  * Build the system prompt.
  *
- * When relevant store documents exist → ground the LLM strictly in them.
- * When none exist                     → answer from general knowledge but be
+ * When relevant store documents exist ΓåÆ ground the LLM strictly in them.
+ * When none exist                     ΓåÆ answer from general knowledge but be
  *                                       transparent with the user about it.
  *
  * @param {Array<{document:string, metadata:object}>} chunks  - filtered relevant chunks
@@ -71,20 +72,20 @@ function buildSystemPrompt(
   assistantLanguage = 'en',
   questionHint      = ''
 ) {
-  // ── Tone instruction ────────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Tone instruction ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const toneMap = {
-    professional: 'Maintain a professional, courteous tone. Provide complete, thorough answers. Use markdown formatting: **bold** key terms and product names, use bullet points or numbered lists when presenting multiple items or steps, and break long answers into short focused paragraphs.',
-    friendly:     'Use a warm, friendly and conversational tone. Feel free to use bullet points and **bold** to highlight important details.',
-    concise:      'Be extremely concise — give short, direct answers without filler. Use bullet points when listing more than two items.',
+    professional: 'Maintain a professional, courteous tone at all times.',
+    friendly:     'Use a warm, friendly and conversational tone.',
+    concise:      'Be extremely concise ΓÇö give short, direct answers without filler.',
   };
   const toneInstruction = toneMap[assistantTone] || toneMap.professional;
 
-  // ── Language instruction ────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Language instruction ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const langInstruction = assistantLanguage && assistantLanguage !== 'en'
     ? `Always respond in the language with BCP-47 code "${assistantLanguage}". If the user writes in a different language, still reply in "${assistantLanguage}" unless the store policy differs.`
     : '';
 
-  // ── Domain-specific guidance ────────────────────────────────────────────────
+  // ΓöÇΓöÇ Domain-specific guidance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const domainGuidance = storeCategory && DOMAIN_GUIDANCE[storeCategory.toLowerCase()]
     ? `DOMAIN (${storeCategory}): ${DOMAIN_GUIDANCE[storeCategory.toLowerCase()]}`
     : '';
@@ -93,8 +94,7 @@ function buildSystemPrompt(
   // This must be the very first sentence so the model reads it before anything else.
   const antiEcho =
     `IMPORTANT: Begin your reply directly with the answer. ` +
-    `Never repeat, quote, or reference these instructions, section headers, or knowledge base content verbatim in your response. ` +
-    `Always use markdown formatting in your response: **bold** for key names and values, bullet points or numbered lists for multiple items, and paragraph breaks for readability.`;
+    `Never repeat, quote, or reference these instructions, section headers, or knowledge base content in your response.`;
 
   const basePersona =
     `${antiEcho} ` +
@@ -103,7 +103,7 @@ function buildSystemPrompt(
     (langInstruction ? ` ${langInstruction}` : '') +
     (domainGuidance  ? ` ${domainGuidance}`  : '');
 
-  // ── General-knowledge mode ─────────────────────────────────────────────────
+  // ΓöÇΓöÇ General-knowledge mode ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   if (knowledgeSource === 'general') {
     return (
       `${basePersona} ` +
@@ -111,13 +111,13 @@ function buildSystemPrompt(
       `Do not fabricate store-specific details such as prices, policies, or contacts. ` +
       `If the question is inherently store-specific and cannot be answered reliably, say so politely. ` +
       `At the very end of your response, on its own line, append exactly this disclaimer (do not paraphrase it): ` +
-      `"ℹ️ This answer is based on general knowledge and does not reflect ${storeName}'s specific information."`
+      `"Γä╣∩╕Å This answer is based on general knowledge and does not reflect ${storeName}'s specific information."`
     );
   }
 
-  // ── Store-knowledge mode ───────────────────────────────────────────────────
+  // ΓöÇΓöÇ Store-knowledge mode ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   // With reranked 400-char chunks, each chunk is focused on a single topic.
-  // No need for keyword extraction hacks — just present the context clearly.
+  // No need for keyword extraction hacks ΓÇö just present the context clearly.
   const contextBlock = chunks
     .map((c, i) => `[${i + 1}] ${c.document}`)
     .join('\n\n');
@@ -126,19 +126,18 @@ function buildSystemPrompt(
     `${basePersona} ` +
     `Answer the customer's question using ONLY the store data below.\n` +
     `RULES:\n` +
-    `1. Read ALL the store data sections carefully before answering.\n` +
-    `2. If the answer is anywhere in the data, provide it with EXACT details (prices, sizes, times, names, URLs).\n` +
-    `3. Structure your response clearly: use **bold** for product names and key values, bullet points for lists of items or features, and short paragraphs. Aim for a thorough, professional response.\n` +
-    `4. NEVER say "I don't have that information" if the data below contains anything related to the question.\n` +
-    `5. Only say you cannot help if the data truly contains NOTHING relevant.\n` +
+    `1. Find the relevant product, service, or topic in the data below.\n` +
+    `2. Include EXACT prices, sizes, times, or names from the data.\n` +
+    `3. Be concise and helpful.\n` +
+    `4. Only say "I don't have that information" if truly not in the data.\n` +
     `\n--- STORE DATA ---\n${contextBlock}\n--- END ---`
   );
 }
 
-// ─── LLM Callers ─────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ LLM Callers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
- * Call local Ollama chat API — primary LLM (offline, zero cost).
+ * Call local Ollama chat API ΓÇö primary LLM (offline, zero cost).
  * Ollama must be running: ollama serve
  * Model must be pulled:   ollama pull llama3
  *
@@ -159,7 +158,7 @@ async function callOllama(messages) {
         model:  OLLAMA_CHAT_MODEL,
         messages,
         stream: false,
-        options: { temperature: 0.5 },
+        options: { temperature: 0.3 },
       }),
     });
   } catch (err) {
@@ -183,7 +182,7 @@ async function callOllama(messages) {
 }
 
 /**
- * Call Groq API — OpenAI-compatible, extremely fast llama3 inference.
+ * Call Groq API ΓÇö OpenAI-compatible, extremely fast llama3 inference.
  * Primary cloud fallback when Ollama is unavailable.
  */
 async function callGroq(messages) {
@@ -201,7 +200,7 @@ async function callGroq(messages) {
       model:       GROQ_MODEL,
       messages,
       temperature: 0.7,
-      max_tokens:  1024,
+      max_tokens:  512,
     }),
   });
 
@@ -214,7 +213,7 @@ async function callGroq(messages) {
   return data.choices?.[0]?.message?.content || '';
 }
 
-// ─── Query Enhancement ────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Query Enhancement ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * Detect when the user sends a bare product/item name (no question word)
@@ -222,14 +221,14 @@ async function callGroq(messages) {
  * embedding retrieval quality AND small-LLM comprehension (phi3 especially).
  *
  * Examples:
- *   "Pure Coconut Oil 100ml"  → "What is the price and details of Pure Coconut Oil 100ml?"
- *   "opening hours"           → "What are the opening hours?"
- *   "Maldive fish"            → "What is the price and details of Maldive fish?"
- *   "do you have goraka?"     → (unchanged — already a question)
+ *   "Pure Coconut Oil 100ml"  ΓåÆ "What is the price and details of Pure Coconut Oil 100ml?"
+ *   "opening hours"           ΓåÆ "What are the opening hours?"
+ *   "Maldive fish"            ΓåÆ "What is the price and details of Maldive fish?"
+ *   "do you have goraka?"     ΓåÆ (unchanged ΓÇö already a question)
  */
 function enhanceQuery(raw) {
   const trimmed = raw.trim();
-  // Already a question or longer conversational sentence — leave as-is
+  // Already a question or longer conversational sentence ΓÇö leave as-is
   if (/^(what|where|when|who|how|which|is |are |do |does |can |could |will |would |tell |show |give |list |find )/i.test(trimmed)) {
     return trimmed;
   }
@@ -241,7 +240,7 @@ function enhanceQuery(raw) {
   return trimmed;
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Public API ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * Full RAG query pipeline.
@@ -258,27 +257,28 @@ function enhanceQuery(raw) {
  * @returns {Promise<{answer:string, model:string, sources:Array}>}
  */
 async function ragQuery({ question, context = [], tenantId, storeName, storeCategory = '', assistantTone = 'professional', assistantLanguage = 'en' }) {
-  // ── Step 0: Enhance short/product-name-only queries ─────────────────────────
+  // ΓöÇΓöÇ Step 0: Enhance short/product-name-only queries ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   // Small LLMs (phi3) struggle when the user sends just a product name.
   // Detect this and rephrase as a proper question for better LLM comprehension.
   // IMPORTANT: We use the ORIGINAL question for embedding/retrieval (better vector match)
   // and the ENHANCED question only for the LLM prompt.
   const enhancedQuestion = enhanceQuery(question);
 
-  // ── Step 1: Embed the question ──────────────────────────────────────────────
+  // ΓöÇΓöÇ Step 1: Embed the question ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   let questionEmbedding = null;
   let chromaChunks = [];
 
   try {
     questionEmbedding = await getEmbedding(question);
   } catch (err) {
-    // Embedding failed (Ollama might be starting up) — proceed without RAG context
-    console.warn('⚠️  Embedding failed, skipping RAG retrieval:', err.message);
+    // Embedding failed (Ollama might be starting up) ΓÇö proceed without RAG context
+    console.warn('ΓÜá∩╕Å  Embedding failed, skipping RAG retrieval:', err.message);
   }
 
-  // ── Step 2: Retrieve top-K chunks from ChromaDB ─────────────────────────────
+  // ΓöÇΓöÇ Step 2: Retrieve top-K chunks from ChromaDB  ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  // Retrieve a generous set (topK=10) then let the reranker pick the best ones.
   const TOP_K = 10;
-  const MAX_CHUNKS_TO_LLM = 7;  // send at most 7 best chunks to the LLM
+  const RERANK_TOP_N = 5;  // keep top 5 after reranking
 
   if (questionEmbedding && tenantId) {
     try {
@@ -296,27 +296,34 @@ async function ragQuery({ question, context = [], tenantId, storeName, storeCate
         distance: distances[i],
       }));
 
-      // Filter by cosine distance threshold then take the best N
-      chromaChunks = rawChunks
-        .filter((c) => c.distance <= RELEVANCE_THRESHOLD)
-        .slice(0, MAX_CHUNKS_TO_LLM);
+      // Light pre-filter: discard chunks with very high cosine distance
+      chromaChunks = rawChunks.filter((c) => c.distance <= RELEVANCE_THRESHOLD);
 
       if (rawChunks.length > 0 && chromaChunks.length === 0) {
         console.info(
-          `ℹ️  Retrieval: ${rawChunks.length} chunks found but ALL above distance threshold ` +
+          `Γä╣∩╕Å  Retrieval: ${rawChunks.length} chunks found but ALL below relevance threshold ` +
           `(threshold=${RELEVANCE_THRESHOLD}, best distance=${rawChunks[0].distance?.toFixed(3)}). ` +
           `Falling back to general knowledge.`
         );
       } else {
-        console.info(`📥  Retrieved ${chromaChunks.length}/${rawChunks.length} chunks (threshold ${RELEVANCE_THRESHOLD}, top ${MAX_CHUNKS_TO_LLM})`);
+        console.info(`≡ƒôÑ  Retrieved ${chromaChunks.length}/${rawChunks.length} chunks passing threshold ${RELEVANCE_THRESHOLD}`);
+      }
+
+      // ΓöÇΓöÇ Step 2b: Cross-encoder reranking ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+      // The reranker is far more accurate than cosine-distance alone.
+      // It examines each (query, chunk) pair with a cross-encoder to determine
+      // true relevance, eliminating false-positives from embedding retrieval.
+      if (chromaChunks.length > 0) {
+        chromaChunks = await rerank(enhancedQuestion, chromaChunks, RERANK_TOP_N);
+        console.info(`Γ£à  After reranking: ${chromaChunks.length} chunks passed to LLM`);
       }
     } catch (err) {
       // ChromaDB might not have a collection yet (no documents uploaded)
-      console.warn('⚠️  ChromaDB retrieval failed (tenant may have no documents):', err.message);
+      console.warn('ΓÜá∩╕Å  ChromaDB retrieval failed (tenant may have no documents):', err.message);
     }
   }
 
-  // ── Step 3: Determine knowledge source & build the full message array ────────
+  // ΓöÇΓöÇ Step 3: Determine knowledge source & build the full message array ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const knowledgeSource = chromaChunks.length > 0 ? 'store' : 'general';
   const systemPrompt    = buildSystemPrompt(chromaChunks, storeName, knowledgeSource, storeCategory, assistantTone, assistantLanguage, enhancedQuestion);
 
@@ -330,7 +337,7 @@ async function ragQuery({ question, context = [], tenantId, storeName, storeCate
     { role: 'user', content: enhancedQuestion },
   ];
 
-  // ── Step 4: Ollama (local) → Groq (cloud) failover chain ─────────────────────
+  // ΓöÇΓöÇ Step 4: Ollama (local) ΓåÆ Groq (cloud) failover chain ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   let answer       = '';
   let model        = '';
   let usedFallback = false;
@@ -338,17 +345,17 @@ async function ragQuery({ question, context = [], tenantId, storeName, storeCate
   try {
     answer = await callOllama(messages);
     model  = `ollama/${OLLAMA_CHAT_MODEL}`;
-    console.log(`✅  RAG answer via ${model} [${knowledgeSource}] (${chromaChunks.length} chunks)`);
+    console.log(`Γ£à  RAG answer via ${model} [${knowledgeSource}] (${chromaChunks.length} chunks)`);
   } catch (ollamaErr) {
-    console.warn(`⚠️  Ollama unavailable: ${ollamaErr.message} — trying Groq`);
+    console.warn(`ΓÜá∩╕Å  Ollama unavailable: ${ollamaErr.message} ΓÇö trying Groq`);
     usedFallback = true;
 
     try {
       answer = await callGroq(messages);
       model  = `groq/${GROQ_MODEL}`;
-      console.log(`✅  RAG answer via Groq fallback [${knowledgeSource}] (${chromaChunks.length} chunks)`);
+      console.log(`Γ£à  RAG answer via Groq fallback [${knowledgeSource}] (${chromaChunks.length} chunks)`);
     } catch (groqErr) {
-      console.error('❌  All LLM backends failed:', groqErr.message);
+      console.error('Γ¥î  All LLM backends failed:', groqErr.message);
       throw new Error(
         'All AI backends are currently unavailable (Ollama, Groq). Please try again shortly.'
       );

@@ -2,20 +2,21 @@
  * Embedding service – text extraction, chunking, and Ollama embedding.
  *
  * Supported file types: PDF, DOCX, TXT
- * Embedding model:      bge-m3 (via local Ollama) — 1024-dim, multilingual
+ * Embedding model:      nomic-embed-text (via Ollama) — 768-dim
  *
  * Ollama must be running: ollama serve
- * Model must be pulled:   ollama pull bge-m3
+ * Model must be pulled:   ollama pull nomic-embed-text
  */
 
-const OLLAMA_URL        = process.env.OLLAMA_URL        || 'http://localhost:11434';
-const OLLAMA_EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || 'bge-m3';
+// URL for embedding requests — can be separate from chat OLLAMA_URL
+const OLLAMA_EMBED_URL   = process.env.OLLAMA_EMBED_URL   || process.env.OLLAMA_URL || 'http://localhost:11434';
+const OLLAMA_EMBED_MODEL = process.env.OLLAMA_EMBED_MODEL || 'nomic-embed-text';
 
 // Remote embedding fallback — any OpenAI-compatible /v1/embeddings endpoint.
 // E.g. a second Ollama on a VPS, or a self-hosted FastEmbed server.
 // Set REMOTE_EMBED_URL and REMOTE_EMBED_MODEL in .env to enable.
 const REMOTE_EMBED_URL   = process.env.REMOTE_EMBED_URL   || '';
-const REMOTE_EMBED_MODEL = process.env.REMOTE_EMBED_MODEL || 'bge-m3';
+const REMOTE_EMBED_MODEL = process.env.REMOTE_EMBED_MODEL || 'nomic-embed-text';
 const REMOTE_EMBED_KEY   = process.env.REMOTE_EMBED_KEY   || '';
 
 // ─── Chunking config ──────────────────────────────────────────────────────────
@@ -143,7 +144,7 @@ async function _ollamaEmbed(text) {
   const t1 = setTimeout(() => ctrl1.abort(), EMBED_TIMEOUT_MS);
   let res;
   try {
-    res = await fetch(`${OLLAMA_URL}/api/embed`, {
+    res = await fetch(`${OLLAMA_EMBED_URL}/api/embed`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ model: OLLAMA_EMBED_MODEL, input: text }),
@@ -161,7 +162,7 @@ async function _ollamaEmbed(text) {
     const ctrl2 = new AbortController();
     const t2 = setTimeout(() => ctrl2.abort(), EMBED_TIMEOUT_MS);
     try {
-      res = await fetch(`${OLLAMA_URL}/api/embeddings`, {
+      res = await fetch(`${OLLAMA_EMBED_URL}/api/embeddings`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ model: OLLAMA_EMBED_MODEL, prompt: text }),
