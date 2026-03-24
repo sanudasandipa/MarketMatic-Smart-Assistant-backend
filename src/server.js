@@ -61,7 +61,7 @@ app.listen(PORT, async () => {
   // Auto-start ChromaDB if it is not already running
   ensureChroma().catch((err) => console.error('ChromaDB auto-start error:', err.message));
   // Pre-warm the Ollama chat model so the first real request isn't blocked by
-  // cold-load time (phi3 is 2.2 GB and takes 30-60 s on CPU from cold).
+  // cold-load time (llama3.1:8b loads from Modal persistent volume on cold start).
   warmUpOllama();
 });
 

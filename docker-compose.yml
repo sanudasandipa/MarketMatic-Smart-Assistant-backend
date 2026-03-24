@@ -76,7 +76,7 @@ services:
     environment:
       OLLAMA_HOST: http://ollama:11434
     entrypoint: ["/bin/sh", "-c",
-      "ollama pull phi3 && ollama pull bge-m3 && echo '✅ Models ready'"]
+      "ollama pull llama3.1:8b && ollama pull nomic-embed-text && echo '✅ Models ready'"]
 
   # ── Node.js Backend ────────────────────────────────────────────────────────
   backend:
@@ -108,7 +108,7 @@ services:
       # Embedding URL — defaults to same as OLLAMA_URL; override in .env if needed
       OLLAMA_EMBED_URL: ${OLLAMA_EMBED_URL:-http://ollama:11434}
       # Explicitly pin model names so both ragService and warmup use the same model
-      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-phi3}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-llama3.1:8b}
       OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
       # Groq cloud fallback — leave blank to disable
       GROQ_API_KEY: ${GROQ_API_KEY:-}

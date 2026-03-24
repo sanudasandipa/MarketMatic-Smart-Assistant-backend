@@ -20,8 +20,8 @@ const REMOTE_EMBED_MODEL = process.env.REMOTE_EMBED_MODEL || 'nomic-embed-text';
 const REMOTE_EMBED_KEY   = process.env.REMOTE_EMBED_KEY   || '';
 
 // ─── Chunking config ──────────────────────────────────────────────────────────
-const CHUNK_SIZE    = 400;  // characters per chunk — smaller = more precise retrieval
-const CHUNK_OVERLAP = 100;  // overlap between consecutive chunks
+const CHUNK_SIZE    = 800;  // characters per chunk — larger keeps Q&A pairs intact
+const CHUNK_OVERLAP = 200;  // overlap between consecutive chunks to bridge boundary context
 const MIN_CHUNK_LEN =  30;  // discard chunks shorter than this
 
 /**
