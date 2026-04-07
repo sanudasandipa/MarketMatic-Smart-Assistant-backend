@@ -20,43 +20,120 @@ const REMOTE_EMBED_MODEL = process.env.REMOTE_EMBED_MODEL || 'nomic-embed-text';
 const REMOTE_EMBED_KEY   = process.env.REMOTE_EMBED_KEY   || '';
 
 // ─── Chunking config ──────────────────────────────────────────────────────────
-const CHUNK_SIZE    = 800;  // characters per chunk — larger keeps Q&A pairs intact
-const CHUNK_OVERLAP = 200;  // overlap between consecutive chunks to bridge boundary context
+const CHUNK_SIZE    = 1200; // characters per chunk — larger keeps full sections intact
+const CHUNK_OVERLAP = 300;  // overlap between consecutive chunks to bridge boundary context
 const MIN_CHUNK_LEN =  30;  // discard chunks shorter than this
 
 /**
- * Split text into paragraph-aware overlapping chunks for better RAG retrieval.
+ * Detect section/category headers in text.
+ * Matches lines like "CATEGORY 1: RICE & GRAINS", "## Section Title", 
+ * or standalone ALL-CAPS titles with 2+ words (not product lines starting with -).
+ */
+function isSectionHeader(line) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.length < 4) return false;
+
+  // Product list items are never headers
+  if (trimmed.startsWith('-')) return false;
+
+  // Markdown headers
+  if (/^#{1,4}\s+\S/.test(trimmed)) return true;
+
+  // Explicit CATEGORY N: ... pattern
+  if (/^CATEGORY\s+\d+\s*:/i.test(trimmed)) return true;
+
+  // Standalone ALL-CAPS title lines (at least 2 words, all uppercase letters/symbols, no lowercase)
+  // Must not contain product-like patterns (prices, sizes like "1kg", "500g", "—")
+  if (/^[A-Z][A-Z0-9 &/,():\-]{4,}$/.test(trimmed) 
+      && !trimmed.includes('—')
+      && !/\d+(kg|g|ml|l)\b/i.test(trimmed)
+      && trimmed.split(/\s+/).length >= 2) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Check if a line is a purely decorative divider (=== or ---) with no real content.
+ */
+function isDividerLine(line) {
+  const trimmed = line.trim();
+  return /^[-=]{3,}$/.test(trimmed);
+}
+
+/**
+ * Split text into section-aware overlapping chunks for better RAG retrieval.
  *
- * Strategy: split into paragraphs first, then merge paragraphs into chunks
- * up to CHUNK_SIZE. This avoids splitting mid-section (e.g. opening hours,
+ * Strategy:
+ * 1. Parse text into logical sections (header + body lines).
+ * 2. Merge sections into chunks up to CHUNK_SIZE.
+ * 3. Prepend the most recent section header to each chunk so embeddings
+ *    capture the category context (e.g. "SPICES & CURRY POWDERS: Ceylon Cinnamon...").
+ * 4. Apply sliding-window overlap to bridge boundary context.
+ *
+ * This avoids splitting mid-section (e.g. product lists, opening hours,
  * pricing tables) which confuses smaller LLMs.
  */
 function chunkText(text) {
-  // Split into paragraphs on double-newlines or section dividers (=== / ---)
-  const paragraphs = text
-    .split(/\n{2,}|(?=={3,})|(?=-{3,})/)
-    .map(p => p.replace(/\s+/g, ' ').trim())
-    .filter(p => p.length >= MIN_CHUNK_LEN);
+  const lines = text.split(/\r?\n/);
 
-  // If paragraph splitting produced nothing useful, fall back to cleaned text
-  if (paragraphs.length === 0) {
-    const cleaned = text.replace(/\s+/g, ' ').trim();
-    if (cleaned.length < MIN_CHUNK_LEN) return [];
-    paragraphs.push(cleaned);
+  // ── Phase 1: Parse into sections ──────────────────────────────────────────
+  // Each section = { header: string|null, body: string }
+  const sections = [];
+  let currentHeader = null;
+  let bodyLines = [];
+
+  for (const line of lines) {
+    if (isDividerLine(line)) continue; // skip decorative dividers entirely
+
+    if (isSectionHeader(line)) {
+      // Flush previous section
+      const bodyText = bodyLines.map(l => l.trim()).filter(l => l.length > 0).join('\n');
+      if (bodyText.length >= MIN_CHUNK_LEN) {
+        sections.push({ header: currentHeader, body: bodyText });
+      }
+      currentHeader = line.trim();
+      bodyLines = [];
+    } else {
+      bodyLines.push(line);
+    }
+  }
+  // Flush last section
+  const lastBody = bodyLines.map(l => l.trim()).filter(l => l.length > 0).join('\n');
+  if (lastBody.length >= MIN_CHUNK_LEN) {
+    sections.push({ header: currentHeader, body: lastBody });
   }
 
+  // If section parsing produced nothing, fall back to cleaned full text
+  if (sections.length === 0) {
+    const cleaned = text.replace(/\s+/g, ' ').trim();
+    if (cleaned.length < MIN_CHUNK_LEN) return [];
+    sections.push({ header: null, body: cleaned });
+  }
+
+  // ── Phase 2: Merge sections into chunks ────────────────────────────────────
   const chunks = [];
   let current = '';
+  let activeHeader = null;
 
-  for (const para of paragraphs) {
-    // If adding this paragraph exceeds chunk size, flush current chunk
-    if (current.length > 0 && current.length + para.length + 1 > CHUNK_SIZE) {
+  for (const section of sections) {
+    // Build the section text with header prepended
+    const sectionText = section.header
+      ? `${section.header}\n${section.body}`
+      : section.body;
+
+    if (current.length > 0 && current.length + sectionText.length + 2 > CHUNK_SIZE) {
+      // Flush current chunk
       chunks.push(current.trim());
-      // Keep overlap from the end of the current chunk
+      // Start new chunk: prepend the active header for context continuity
       const overlapStart = Math.max(0, current.length - CHUNK_OVERLAP);
-      current = current.slice(overlapStart).trim();
+      const overlap = current.slice(overlapStart).trim();
+      current = activeHeader ? `${activeHeader}\n${overlap}` : overlap;
     }
-    current += (current.length > 0 ? ' ' : '') + para;
+
+    if (section.header) activeHeader = section.header;
+    current += (current.length > 0 ? '\n' : '') + sectionText;
   }
 
   // Flush remaining text
@@ -64,7 +141,7 @@ function chunkText(text) {
     chunks.push(current.trim());
   }
 
-  // Safety: if a single paragraph is larger than CHUNK_SIZE, split it with sliding window
+  // ── Phase 3: Safety split for oversized chunks ─────────────────────────────
   const final = [];
   for (const chunk of chunks) {
     if (chunk.length <= CHUNK_SIZE) {
@@ -73,7 +150,11 @@ function chunkText(text) {
       let start = 0;
       while (start < chunk.length) {
         const end = Math.min(start + CHUNK_SIZE, chunk.length);
-        const sub = chunk.slice(start, end).trim();
+        let sub = chunk.slice(start, end).trim();
+        // Prepend active header if this sub-chunk doesn't start with one
+        if (start > 0 && activeHeader && !isSectionHeader(sub.split('\n')[0])) {
+          sub = `${activeHeader}\n${sub}`;
+        }
         if (sub.length >= MIN_CHUNK_LEN) final.push(sub);
         start += CHUNK_SIZE - CHUNK_OVERLAP;
       }

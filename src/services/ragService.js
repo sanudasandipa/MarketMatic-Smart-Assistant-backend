@@ -10,7 +10,7 @@
  */
 
 const { getEmbedding } = require('./embeddingService');
-const { queryCollection } = require('./chromaService');
+const { queryCollection, getAllChunks } = require('./chromaService');
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const OLLAMA_CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || 'llama3.1:8b';
@@ -20,8 +20,8 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
-const BASE_RELEVANCE_THRESHOLD = parseFloat(process.env.RAG_RELEVANCE_THRESHOLD || '0.50');
-const BASE_CONTEXT_BUDGET_CHARS = parseInt(process.env.RAG_CONTEXT_BUDGET_CHARS || '5200', 10);
+const BASE_RELEVANCE_THRESHOLD = parseFloat(process.env.RAG_RELEVANCE_THRESHOLD || '0.35');
+const BASE_CONTEXT_BUDGET_CHARS = parseInt(process.env.RAG_CONTEXT_BUDGET_CHARS || '8000', 10);
 const NEAR_DUPLICATE_OVERLAP = parseFloat(process.env.RAG_NEAR_DUPLICATE_OVERLAP || '0.88');
 const MAX_HISTORY = parseInt(process.env.RAG_MAX_HISTORY || '10', 10);
 
@@ -125,13 +125,13 @@ function getAdaptiveRetrievalSettings(question) {
 
   return {
     broadQuery,
-    topK: broadQuery ? 24 : shortQuery ? 14 : 18,
-    maxChunksToLlm: broadQuery ? 12 : shortQuery ? 8 : 10,
+    topK: broadQuery ? 30 : shortQuery ? 18 : 22,
+    maxChunksToLlm: broadQuery ? 16 : shortQuery ? 10 : 12,
     minChunks: broadQuery ? 6 : 3,
-    maxPerFile: broadQuery ? 4 : 3,
-    threshold: clamp(BASE_RELEVANCE_THRESHOLD + (broadQuery ? 0.05 : 0), 0.15, 0.65),
+    maxPerFile: broadQuery ? 8 : 6,
+    threshold: clamp(BASE_RELEVANCE_THRESHOLD + (broadQuery ? 0.05 : 0), 0.15, 0.55),
     contextCharBudget: broadQuery
-      ? BASE_CONTEXT_BUDGET_CHARS + 2600
+      ? BASE_CONTEXT_BUDGET_CHARS + 3000
       : BASE_CONTEXT_BUDGET_CHARS,
   };
 }
@@ -418,6 +418,49 @@ async function ragQuery({
 
       if (filtered.length > 0) {
         chromaChunks = selectDiverseChunks(dedupeChunks(filtered), settings);
+      }
+
+      // ── Keyword fallback: if semantic search returned 0 relevant chunks, ─────
+      // scan all stored chunks for exact keyword matches. This catches cases
+      // where the embedding model doesn't capture semantic similarity but the
+      // exact term exists in the text.
+      if (chromaChunks.length === 0 && rawQuestion.length > 2) {
+        try {
+          const allData = await getAllChunks(tenantId);
+          const allDocs = allData.documents || [];
+          const allMetas = allData.metadatas || [];
+          const allIds = allData.ids || [];
+          const queryTerms = rawQuestion.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
+
+          const keywordHits = [];
+          for (let i = 0; i < allDocs.length; i++) {
+            const docLower = (allDocs[i] || '').toLowerCase();
+            const matchCount = queryTerms.filter(term => docLower.includes(term)).length;
+            if (matchCount > 0) {
+              keywordHits.push({
+                id: allIds[i],
+                document: allDocs[i],
+                metadata: allMetas[i] || {},
+                distance: null,
+                __matchCount: matchCount,
+              });
+            }
+          }
+
+          if (keywordHits.length > 0) {
+            // Sort by number of matching terms (desc), take top chunks
+            keywordHits.sort((a, b) => b.__matchCount - a.__matchCount);
+            const kwChunks = keywordHits
+              .slice(0, settings.maxChunksToLlm)
+              .map(({ __matchCount, ...rest }) => rest);
+            chromaChunks = selectDiverseChunks(dedupeChunks(kwChunks), settings);
+            console.info(
+              `Keyword fallback found ${keywordHits.length} hits -> selected ${chromaChunks.length} chunks`
+            );
+          }
+        } catch (kwErr) {
+          console.warn(`Keyword fallback failed: ${kwErr.message}`);
+        }
       }
 
       if (rawChunks.length > 0 && chromaChunks.length === 0) {
